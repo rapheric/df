@@ -27,27 +27,27 @@ public class UploadsController : ControllerBase
 
     [HttpPost]
     [RequestSizeLimit(50_000_000)]
-    public async Task<IActionResult> Upload([FromForm] IFormFile file)
+    public async Task<IActionResult> Upload([FromForm] NCBA.DCL.DTOs.FileUploadDto dto)
     {
         try
         {
-            if (file == null || file.Length == 0)
+            if (dto.File == null || dto.File.Length == 0)
                 return BadRequest(new { success = false, error = "No file uploaded" });
 
-            var checklistIdStr = Request.Form["checklistId"].FirstOrDefault();
-            var documentIdStr = Request.Form["documentId"].FirstOrDefault();
-            var documentName = Request.Form["documentName"].FirstOrDefault() ?? file.FileName;
-            var category = Request.Form["category"].FirstOrDefault();
+            var checklistIdStr = dto.ChecklistId;
+            var documentIdStr = dto.DocumentId;
+            var documentName = dto.DocumentName ?? dto.File.FileName;
+            var category = dto.Category;
 
             var uploadsDir = Path.Combine(_env.ContentRootPath, "uploads");
             if (!Directory.Exists(uploadsDir)) Directory.CreateDirectory(uploadsDir);
 
-            var uniqueName = $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{Guid.NewGuid()}{Path.GetExtension(file.FileName)}";
+            var uniqueName = $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{Guid.NewGuid()}{Path.GetExtension(dto.File.FileName)}";
             var filePath = Path.Combine(uploadsDir, uniqueName);
 
             await using (var stream = System.IO.File.Create(filePath))
             {
-                await file.CopyToAsync(stream);
+                await dto.File.CopyToAsync(stream);
             }
 
             var upload = new Upload
@@ -57,11 +57,11 @@ public class UploadsController : ControllerBase
                 DocumentId = Guid.TryParse(documentIdStr, out var dId) ? dId : (Guid?)null,
                 DocumentName = documentName,
                 Category = category,
-                FileName = file.FileName,
+                FileName = dto.File.FileName,
                 FilePath = $"/uploads/{uniqueName}",
                 FileUrl = $"/uploads/{uniqueName}",
-                FileSize = file.Length,
-                FileType = file.ContentType,
+                FileSize = dto.File.Length,
+                FileType = dto.File.ContentType,
                 UploadedBy = User?.Identity?.Name ?? "RM",
                 Status = "active",
                 CreatedAt = DateTime.UtcNow,
