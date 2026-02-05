@@ -54,6 +54,10 @@ builder.Services.AddAuthentication(options =>
 
 builder.Services.AddAuthorization();
 
+// Register SignalR and online user tracker
+builder.Services.AddSignalR();
+builder.Services.AddSingleton<OnlineUserTracker>();
+
 // Register custom services
 builder.Services.AddScoped<JwtTokenGenerator>();
 builder.Services.AddScoped<IEmailService, EmailService>();
@@ -128,6 +132,9 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapControllers();
+
+// Map SignalR hub
+app.MapHub<NCBA.DCL.Hubs.DclHub>("/hub/dcl");
 
 // Health check endpoint
 app.MapGet("/", () => new { message = "NCBA DCL API is running", version = "1.0.0" });

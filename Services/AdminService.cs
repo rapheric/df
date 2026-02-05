@@ -189,7 +189,7 @@ namespace NCBA.DCL.Services
             }
 
             // Extension: update CreatedById
-            var extensionList = _db.Set<Models.Extension>().Where(e => e.CreatedById == fromUserId);
+            var extensionList = _db.Extensions.Where(e => e.CreatedById == fromUserId);
             foreach (var e in extensionList)
             {
                 e.CreatedById = toUserId;
@@ -219,3 +219,4 @@ namespace NCBA.DCL.Services
         }
     }
 }
+

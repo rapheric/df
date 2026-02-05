@@ -20,7 +20,13 @@ public class ApplicationDbContext : DbContext
     public DbSet<DeferralDocument> DeferralDocuments { get; set; }
     public DbSet<Approver> Approvers { get; set; }
     public DbSet<UserLog> UserLogs { get; set; }
+    public DbSet<AuditLog> AuditLogs { get; set; }
     public DbSet<Notification> Notifications { get; set; }
+    public DbSet<Upload> Uploads { get; set; }
+    public DbSet<Extension> Extensions { get; set; }
+    public DbSet<ExtensionApprover> ExtensionApprovers { get; set; }
+    public DbSet<ExtensionHistory> ExtensionHistories { get; set; }
+    public DbSet<ExtensionComment> ExtensionComments { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -206,6 +212,55 @@ public class ApplicationDbContext : DbContext
                 .WithMany(u => u.Notifications)
                 .HasForeignKey(n => n.UserId)
                 .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // Upload configuration
+        modelBuilder.Entity<Upload>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.FileSize).HasColumnType("bigint");
+            entity.HasIndex(e => e.ChecklistId);
+            entity.HasIndex(e => e.DocumentId);
+            entity.Property(e => e.Status).HasMaxLength(50);
+        });
+
+        // Extension configuration
+        modelBuilder.Entity<Extension>(entity =\u003e
+        {
+            entity.HasKey(e =\u003e e.Id);
+            entity.Property(e =\u003e e.Status).HasConversion<string>();
+            entity.Property(e =\u003e e.CreatorApprovalStatus).HasConversion<string>();
+            entity.Property(e =\u003e e.CheckerApprovalStatus).HasConversion<string>();
+            
+            entity.HasOne(e =\u003e e.Deferral).WithMany().HasForeignKey(e =\u003e e.DeferralId).OnDelete(DeleteBehavior.SetNull);
+            entity.HasOne(e =\u003e e.RequestedBy).WithMany().HasForeignKey(e =\u003e e.RequestedById).OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e =\u003e e.CreatorApprovedBy).WithMany().HasForeignKey(e =\u003e e.CreatorApprovedById).OnDelete(DeleteBehavior.SetNull);
+            entity.HasOne(e =\u003e e.CheckerApprovedBy).WithMany().HasForeignKey(e =\u003e e.CheckerApprovedById).OnDelete(DeleteBehavior.SetNull);
+        });
+
+        // ExtensionApprover configuration
+        modelBuilder.Entity<ExtensionApprover>(entity =\u003e
+        {
+            entity.HasKey(e =\u003e e.Id);
+            entity.Property(e =\u003e e.ApprovalStatus).HasConversion<string>();
+            entity.HasOne(ea =\u003e ea.Extension).WithMany(e =\u003e e.Approvers).HasForeignKey(ea =\u003e ea.ExtensionId).OnDelete(DeleteBehavior.Cascade);
+            entity.HasOne(ea =\u003e ea.User).WithMany().HasForeignKey(ea =\u003e ea.UserId).OnDelete(DeleteBehavior.SetNull);
+        });
+
+        // ExtensionHistory configuration
+        modelBuilder.Entity<ExtensionHistory>(entity =\u003e
+        {
+            entity.HasKey(e =\u003e e.Id);
+            entity.HasOne(eh =\u003e eh.Extension).WithMany(e =\u003e e.History).HasForeignKey(eh =\u003e eh.ExtensionId).OnDelete(DeleteBehavior.Cascade);
+            entity.HasOne(eh =\u003e eh.User).WithMany().HasForeignKey(eh =\u003e eh.UserId).OnDelete(DeleteBehavior.SetNull);
+        });
+
+        // ExtensionComment configuration
+        modelBuilder.Entity<ExtensionComment>(entity =\u003e
+        {
+            entity.HasKey(e =\u003e e.Id);
+            entity.HasOne(ec =\u003e ec.Extension).WithMany(e =\u003e e.Comments).HasForeignKey(ec =\u003e ec.ExtensionId).OnDelete(DeleteBehavior.Cascade);
+            entity.HasOne(ec =\u003e ec.Author).WithMany().HasForeignKey(ec =\u003e ec.AuthorId).OnDelete(DeleteBehavior.SetNull);
         });
     }
 
