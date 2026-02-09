@@ -145,6 +145,21 @@ public class SubmitToCoCreatorRequest
 
     [JsonPropertyName("documents")]
     public List<RmDocumentUpdateDto>? Documents { get; set; }
+
+    [JsonPropertyName("supportingDocs")]
+    public List<SupportingDocDto>? SupportingDocs { get; set; }
+}
+
+public class SupportingDocDto
+{
+    [JsonPropertyName("id")]
+    public string? Id { get; set; }
+
+    [JsonPropertyName("name")]
+    public string? Name { get; set; }
+
+    [JsonPropertyName("fileUrl")]
+    public string? FileUrl { get; set; }
 }
 
 // CoCreator SubmitToRM Request - saves document updates before submitting

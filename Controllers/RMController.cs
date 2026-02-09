@@ -154,61 +154,85 @@ public class RMController : ControllerBase
                 return NotFound(new { error = "Checklist not found" });
             }
 
+            _logger.LogInformation($"📋 RM Submission - Checklist {checklist.DclNo} loaded with {checklist.Documents.Count} document categories");
+
             /* ===========================
                1. Update documents (RM only)
                ✅ Do NOT overwrite CO-Creator status
             =========================== */
             if (request.Documents != null && request.Documents.Any())
             {
+                _logger.LogInformation($"📋 Processing {request.Documents.Count} document updates");
+                int docsUpdated = 0;
+
                 foreach (var updatedDoc in request.Documents)
                 {
-                    if (string.IsNullOrEmpty(updatedDoc.Category) || !updatedDoc.DocumentId.HasValue)
+                    if (string.IsNullOrEmpty(updatedDoc.Category))
+                    {
+                        _logger.LogWarning($"⚠️ Document update skipped - missing category");
                         continue;
+                    }
+
+                    if (!updatedDoc.DocumentId.HasValue)
+                    {
+                        _logger.LogWarning($"⚠️ Document update skipped - missing DocumentId. _id={updatedDoc._id}, Id={updatedDoc.Id}");
+                        continue;
+                    }
 
                     var category = checklist.Documents.FirstOrDefault(c => c.Category == updatedDoc.Category);
-                    if (category == null) continue;
+                    if (category == null)
+                    {
+                        _logger.LogWarning($"⚠️ Category '{updatedDoc.Category}' not found");
+                        continue;
+                    }
 
                     var doc = category.DocList.FirstOrDefault(d => d.Id == updatedDoc.DocumentId.Value);
-                    if (doc == null) continue;
+                    if (doc == null)
+                    {
+                        _logger.LogWarning($"⚠️ Document {updatedDoc.DocumentId.Value} not found in category '{updatedDoc.Category}'");
+                        continue;
+                    }
+
+                    docsUpdated++;
 
                     // Only RM fields
                     if (updatedDoc.Status.HasValue)
                     {
                         doc.Status = updatedDoc.Status.Value;
-                        _logger.LogInformation($"📋 Document {doc.Name} - Status updated: {updatedDoc.Status.Value}");
                     }
 
                     if (updatedDoc.RmStatus.HasValue)
                     {
                         doc.RmStatus = updatedDoc.RmStatus.Value;
-                        _logger.LogInformation($"📋 Document {doc.Name} - RmStatus updated: {updatedDoc.RmStatus.Value}");
                     }
 
                     if (!string.IsNullOrEmpty(updatedDoc.Comment))
                     {
                         doc.Comment = updatedDoc.Comment;
-                        _logger.LogInformation($"📋 Document {doc.Name} - Comment updated");
                     }
 
                     if (!string.IsNullOrEmpty(updatedDoc.FileUrl))
                     {
                         doc.FileUrl = updatedDoc.FileUrl;
-                        _logger.LogInformation($"📋 Document {doc.Name} - FileUrl updated");
                     }
 
                     if (!string.IsNullOrEmpty(updatedDoc.DeferralReason))
                     {
                         doc.DeferralReason = updatedDoc.DeferralReason;
-                        _logger.LogInformation($"📋 Document {doc.Name} - DeferralReason updated");
                     }
 
                     // ✅ Save deferral number when RM sets it
                     if (!string.IsNullOrWhiteSpace(updatedDoc.DeferralNumber))
                     {
                         doc.DeferralNumber = updatedDoc.DeferralNumber;
-                        _logger.LogInformation($"📋 Document {doc.Name} - Deferral Number updated: {updatedDoc.DeferralNumber}");
                     }
+
+                    // Mark document as modified by setting UpdatedAt
+                    doc.UpdatedAt = DateTime.UtcNow;
+                    _logger.LogInformation($"✅ Document '{doc.Name}' in category '{updatedDoc.Category}' updated successfully");
                 }
+
+                _logger.LogInformation($"✅ {docsUpdated} documents updated");
             }
 
             /* ===========================
@@ -225,12 +249,39 @@ public class RMController : ControllerBase
                     Timestamp = DateTime.UtcNow
                 };
                 _context.ChecklistLogs.Add(commentLog);
+                _logger.LogInformation($"📝 RM comment added: {request.RmGeneralComment}");
+            }
+
+            /* ===========================
+               2b. Handle supporting documents (Store reference URLs)
+            =========================== */
+            if (request.SupportingDocs != null && request.SupportingDocs.Any())
+            {
+                _logger.LogInformation($"📎 Processing {request.SupportingDocs.Count} supporting documents");
+                // Store supporting docs as a JSON field or separate entity
+                // For now, we'll create logs for tracking
+                foreach (var supportingDoc in request.SupportingDocs)
+                {
+                    if (!string.IsNullOrEmpty(supportingDoc.FileUrl))
+                    {
+                        var supportingDocLog = new ChecklistLog
+                        {
+                            Id = Guid.NewGuid(),
+                            Message = $"Supporting Document uploaded: {supportingDoc.Name}",
+                            UserId = userId,
+                            ChecklistId = request.ChecklistId.Value,
+                            Timestamp = DateTime.UtcNow
+                        };
+                        _context.ChecklistLogs.Add(supportingDocLog);
+                    }
+                }
             }
 
             /* ===========================
                3. Move checklist to Co-Creator
             =========================== */
             checklist.Status = ChecklistStatus.CoCreatorReview;
+            checklist.UpdatedAt = DateTime.UtcNow; // Mark checklist as modified
 
             // Add log entry
             var log = new ChecklistLog
@@ -314,6 +365,7 @@ public class RMController : ControllerBase
                 .Include(c => c.Documents)
                     .ThenInclude(dc => dc.DocList)
                         .ThenInclude(d => d.CoCreatorFiles)
+                .Include(c => c.SupportingDocs)
                 .Include(c => c.Logs)
                     .ThenInclude(l => l.User)
                 .FirstOrDefaultAsync(c => c.Id == id);
@@ -357,6 +409,17 @@ public class RMController : ControllerBase
                             name = cf.Name
                         }).ToList()
                     }).ToList()
+                }).ToList(),
+                supportingDocs = checklist.SupportingDocs.Select(sd => new
+                {
+                    id = sd.Id,
+                    name = sd.FileName,
+                    fileUrl = sd.FileUrl,
+                    fileSize = sd.FileSize,
+                    fileType = sd.FileType,
+                    uploadedBy = sd.UploadedBy != null ? new { id = sd.UploadedBy.Id, name = sd.UploadedBy.Name } : null,
+                    uploadedByRole = sd.UploadedByRole,
+                    uploadedAt = sd.UploadedAt
                 }).ToList(),
                 logs = checklist.Logs.Select(l => new
                 {

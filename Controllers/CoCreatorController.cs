@@ -310,13 +310,20 @@ public class CoCreatorController : ControllerBase
                         DocList = new List<Document>() // Initialize doc list
                     };
 
-                    foreach (var docDto in catDto.DocList ?? new List<Document>())
+                    foreach (var docDto in catDto.DocList ?? new List<DocumentCreateDto>())
                     {
+                        // Parse status string to DocumentStatus enum, default to PendingRM if parsing fails
+                        DocumentStatus docStatus = DocumentStatus.PendingRM;
+                        if (!string.IsNullOrEmpty(docDto.Status) && Enum.TryParse<DocumentStatus>(docDto.Status, ignoreCase: true, out var parsedStatus))
+                        {
+                            docStatus = parsedStatus;
+                        }
+
                         var doc = new Document
                         {
                             Id = Guid.NewGuid(),
-                            Name = $"{category.Category} Document", // Or pass name from DTO if available
-                            Status = docDto.Status,
+                            Name = docDto.Name ?? $"{category.Category} Document",
+                            Status = docStatus,
                             FileUrl = docDto.FileUrl,
                             Comment = docDto.Comment,
                             DeferralReason = docDto.DeferralReason,
@@ -505,6 +512,7 @@ public class CoCreatorController : ControllerBase
                 .Include(c => c.Documents)
                     .ThenInclude(dc => dc.DocList)
                         .ThenInclude(d => d.CoCreatorFiles)
+                .Include(c => c.SupportingDocs)
                 .Include(c => c.Logs)
                     .ThenInclude(l => l.User)
                 .FirstOrDefaultAsync(c => c.Id == id);
@@ -552,6 +560,17 @@ public class CoCreatorController : ControllerBase
                         }).ToList()
                     }).ToList()
                 }).ToList(),
+                supportingDocs = checklist.SupportingDocs.Select(sd => new
+                {
+                    id = sd.Id,
+                    name = sd.FileName,
+                    fileUrl = sd.FileUrl,
+                    fileSize = sd.FileSize,
+                    fileType = sd.FileType,
+                    uploadedBy = sd.UploadedBy != null ? new { id = sd.UploadedBy.Id, name = sd.UploadedBy.Name } : null,
+                    uploadedByRole = sd.UploadedByRole,
+                    uploadedAt = sd.UploadedAt
+                }).ToList(),
                 logs = checklist.Logs.Select(l => new
                 {
                     id = l.Id,
@@ -586,6 +605,7 @@ public class CoCreatorController : ControllerBase
                 .Include(c => c.AssignedToCoChecker)
                 .Include(c => c.Documents)
                     .ThenInclude(dc => dc.DocList)
+                .Include(c => c.SupportingDocs)
                 .FirstOrDefaultAsync(c => c.DclNo == dclNo);
 
             if (checklist == null)
@@ -623,6 +643,17 @@ public class CoCreatorController : ControllerBase
                         comment = d.Comment,
                         deferralNumber = d.DeferralNumber
                     }).ToList()
+                }).ToList(),
+                supportingDocs = checklist.SupportingDocs.Select(sd => new
+                {
+                    id = sd.Id,
+                    name = sd.FileName,
+                    fileUrl = sd.FileUrl,
+                    fileSize = sd.FileSize,
+                    fileType = sd.FileType,
+                    uploadedBy = sd.UploadedBy != null ? new { id = sd.UploadedBy.Id, name = sd.UploadedBy.Name } : null,
+                    uploadedByRole = sd.UploadedByRole,
+                    uploadedAt = sd.UploadedAt
                 }).ToList(),
                 createdAt = checklist.CreatedAt,
                 updatedAt = checklist.UpdatedAt
@@ -1213,9 +1244,9 @@ public class CoCreatorController : ControllerBase
                     var category = checklist.Documents.FirstOrDefault(c => c.Category == catUpdate.Category);
                     if (category == null) continue;
 
-                    foreach (var docUpdate in catUpdate.DocList ?? new List<DocumentDto>())
+                    foreach (var docUpdate in catUpdate.DocList ?? new List<DocumentUpdateInSubmitDto>())
                     {
-                        var docId = docUpdate.DocumentId ?? docUpdate.Id ?? docUpdate._id;
+                        var docId = docUpdate.Id ?? docUpdate._id;
                         if (!docId.HasValue) continue;
 
                         var doc = category.DocList.FirstOrDefault(d => d.Id == docId.Value);
@@ -1225,8 +1256,8 @@ public class CoCreatorController : ControllerBase
                         if (!string.IsNullOrEmpty(docUpdate.Comment))
                             doc.Comment = docUpdate.Comment;
 
-                        if (docUpdate.Status.HasValue)
-                            doc.Status = docUpdate.Status.Value;
+                        if (!string.IsNullOrEmpty(docUpdate.Status) && Enum.TryParse<DocumentStatus>(docUpdate.Status, ignoreCase: true, out var status))
+                            doc.Status = status;
 
                         if (!string.IsNullOrEmpty(docUpdate.FileUrl))
                             doc.FileUrl = docUpdate.FileUrl;
@@ -1245,6 +1276,7 @@ public class CoCreatorController : ControllerBase
             }
 
             checklist.Status = ChecklistStatus.RMReview;
+            checklist.UpdatedAt = DateTime.UtcNow;
 
             var log = new ChecklistLog
             {
@@ -1275,12 +1307,19 @@ public class CoCreatorController : ControllerBase
 
             _logger.LogInformation($"? Checklist {checklist.DclNo} submitted to RM with updated documents");
 
-            return Ok(new { message = "Checklist submitted to RM successfully" });
+            // Return only essential data to avoid serialization issues with full object graph
+            return Ok(new
+            {
+                message = "Checklist submitted to RM successfully",
+                checklistId = id,
+                dclNo = checklist.DclNo,
+                status = checklist.Status.ToString()
+            });
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error submitting to RM");
-            return StatusCode(500, new { message = "Internal server error" });
+            return StatusCode(500, new { message = "Internal server error", error = ex.Message });
         }
     }
 
@@ -1302,6 +1341,7 @@ public class CoCreatorController : ControllerBase
             }
 
             checklist.Status = ChecklistStatus.CoCheckerReview;
+            checklist.UpdatedAt = DateTime.UtcNow;
 
             var log = new ChecklistLog
             {
@@ -1330,12 +1370,19 @@ public class CoCreatorController : ControllerBase
 
             await _context.SaveChangesAsync();
 
-            return Ok(new { message = "Checklist submitted to Co-Checker successfully" });
+            // Return only essential data to avoid serialization issues
+            return Ok(new
+            {
+                message = "Checklist submitted to Co-Checker successfully",
+                checklistId = id,
+                dclNo = checklist.DclNo,
+                status = checklist.Status.ToString()
+            });
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error submitting to co-checker");
-            return StatusCode(500, new { message = "Internal server error" });
+            return StatusCode(500, new { message = "Internal server error", error = ex.Message });
         }
     }
 
@@ -1712,8 +1759,24 @@ public class CreateChecklistRequest
     public string? CustomerName { get; set; }
     public string? LoanType { get; set; }
     public Guid? AssignedToRMId { get; set; }
-    public List<DocumentCategory>? Documents { get; set; }
+    public List<DocumentCategoryCreateDto>? Documents { get; set; }
     public string? IbpsNo { get; set; }
+}
+
+public class DocumentCategoryCreateDto
+{
+    public string? Category { get; set; }
+    public List<DocumentCreateDto>? DocList { get; set; }
+}
+
+public class DocumentCreateDto
+{
+    public string? Name { get; set; }
+    public string? Status { get; set; }
+    public string? FileUrl { get; set; }
+    public string? Comment { get; set; }
+    public string? DeferralReason { get; set; }
+    public string? DeferralNumber { get; set; }
 }
 
 public class UpdateChecklistRequest
@@ -1754,10 +1817,25 @@ public class CoCreatorSubmitToCCRequest
 
 public class SubmitToRMRequest
 {
-    public string? Category { get; set; }
-    public List<DocumentDto>? DocList { get; set; }
-    public List<DocumentDto>? Documents { get; set; }
+    public List<DocumentCategoryUpdateDto>? Documents { get; set; }
     public string? CreatorComment { get; set; }
+}
+
+public class DocumentCategoryUpdateDto
+{
+    public string? Category { get; set; }
+    public List<DocumentUpdateInSubmitDto>? DocList { get; set; }
+}
+
+public class DocumentUpdateInSubmitDto
+{
+    public Guid? Id { get; set; }
+    public Guid? _id { get; set; }
+    public string? Name { get; set; }
+    public string? Status { get; set; }
+    public string? Comment { get; set; }
+    public string? FileUrl { get; set; }
+    public string? DeferralReason { get; set; }
     public string? DeferralNumber { get; set; }
 }
 

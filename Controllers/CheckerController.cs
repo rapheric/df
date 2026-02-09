@@ -83,8 +83,14 @@ public class CheckerController : ControllerBase
                            c.Status == ChecklistStatus.CoCheckerReview)
                 .Include(c => c.CreatedBy)
                 .Include(c => c.AssignedToRM)
+                .Include(c => c.AssignedToCoChecker)
                 .Include(c => c.Documents)
                     .ThenInclude(dc => dc.DocList)
+                        .ThenInclude(d => d.CoCreatorFiles)
+                .Include(c => c.SupportingDocs)
+                    .ThenInclude(sd => sd.UploadedBy)
+                .Include(c => c.Logs)
+                    .ThenInclude(l => l.User)
                 .OrderByDescending(c => c.UpdatedAt)
                 .Select(c => new
                 {
@@ -97,7 +103,19 @@ public class CheckerController : ControllerBase
                     status = c.Status.ToString(),
                     createdBy = c.CreatedBy != null ? new { id = c.CreatedBy.Id, name = c.CreatedBy.Name } : null,
                     assignedToRM = c.AssignedToRM != null ? new { id = c.AssignedToRM.Id, name = c.AssignedToRM.Name } : null,
+                    assignedToCoChecker = c.AssignedToCoChecker != null ? new { id = c.AssignedToCoChecker.Id, name = c.AssignedToCoChecker.Name } : null,
                     documents = c.Documents,
+                    supportingDocs = c.SupportingDocs.Select(sd => new
+                    {
+                        id = sd.Id,
+                        _id = sd.Id,
+                        fileName = sd.FileName,
+                        fileUrl = sd.FileUrl,
+                        fileSize = sd.FileSize,
+                        fileType = sd.FileType,
+                        uploadedBy = sd.UploadedBy != null ? sd.UploadedBy.Name : "Unknown",
+                        uploadedAt = sd.UploadedAt
+                    }).ToList(),
                     createdAt = c.CreatedAt,
                     updatedAt = c.UpdatedAt
                 })
@@ -172,6 +190,7 @@ public class CheckerController : ControllerBase
                 .Include(c => c.Documents)
                     .ThenInclude(dc => dc.DocList)
                         .ThenInclude(d => d.CoCreatorFiles)
+                .Include(c => c.SupportingDocs)
                 .Include(c => c.Logs)
                     .ThenInclude(l => l.User)
                 .FirstOrDefaultAsync(c => c.Id == id);
@@ -437,6 +456,7 @@ public class CheckerController : ControllerBase
                     }
 
                     doc.CheckerStatus = finalCheckerStatus;
+                    doc.UpdatedAt = DateTime.UtcNow; // Ensure document update timestamp is set
                 }
             }
 
@@ -444,6 +464,20 @@ public class CheckerController : ControllerBase
             checklist.Status = newStatus;
             checklist.LastUpdatedBy = userId;
             checklist.UpdatedAt = DateTime.UtcNow;
+
+            // Log Checker's general comment if provided
+            if (!string.IsNullOrWhiteSpace(request.CheckerComment))
+            {
+                var commentLog = new ChecklistLog
+                {
+                    Id = Guid.NewGuid(),
+                    Message = request.CheckerComment,
+                    UserId = userId,
+                    ChecklistId = checklist.Id,
+                    Timestamp = DateTime.UtcNow
+                };
+                _context.ChecklistLogs.Add(commentLog);
+            }
 
             // Log Audit
             await _auditLogService.CreateLogAsync(new DTOs.AuditLogCreateDto
@@ -534,16 +568,30 @@ public class CheckerController : ControllerBase
 
             await _context.SaveChangesAsync();
 
+            // Reload the checklist with all includes to return updated data
+            var updatedChecklist = await _context.Checklists
+                .Include(c => c.CreatedBy)
+                .Include(c => c.AssignedToRM)
+                .Include(c => c.AssignedToCoChecker)
+                .Include(c => c.Documents)
+                    .ThenInclude(dc => dc.DocList)
+                .Include(c => c.SupportingDocs)
+                .FirstOrDefaultAsync(c => c.Id == checklist.Id);
+
             return Ok(new
             {
-                message = $"Checklist/document successfully updated to {newStatus}",
-                checklist
+                message = $"Checklist successfully updated to {newStatus}",
+                checklistId = checklist.Id,
+                dclNo = checklist.DclNo,
+                status = newStatus.ToString(),
+                updatedAt = DateTime.UtcNow,
+                checklist = updatedChecklist // Include full checklist for verification
             });
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Checker status update error");
-            return StatusCode(500, new { error = "Failed to process checker action" });
+            return StatusCode(500, new { error = "Failed to process checker action", details = ex.Message });
         }
     }
 
