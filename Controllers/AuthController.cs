@@ -18,6 +18,7 @@ public class AuthController : ControllerBase
     private readonly JwtTokenGenerator _tokenGenerator;
     private readonly IMFAService _mfaService;
     private readonly ISSOService _ssoService;
+    private readonly IEmailService _emailService;
     private readonly ILogger<AuthController> _logger;
 
     public AuthController(
@@ -25,12 +26,14 @@ public class AuthController : ControllerBase
         JwtTokenGenerator tokenGenerator,
         IMFAService mfaService,
         ISSOService ssoService,
+        IEmailService emailService,
         ILogger<AuthController> logger)
     {
         _context = context;
         _tokenGenerator = tokenGenerator;
         _mfaService = mfaService;
         _ssoService = ssoService;
+        _emailService = emailService;
         _logger = logger;
     }
 
@@ -548,4 +551,329 @@ public class AuthController : ControllerBase
         var tokenString = $"{userId}:{DateTime.UtcNow.AddMinutes(15).Ticks}";
         return Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(tokenString));
     }
+
+    // ==================== Enhanced Security Endpoints ====================
+
+    /// <summary>
+    /// Logout endpoint with email verification
+    /// Sends verification code to user's email and logs the action
+    /// </summary>
+    [Authorize]
+    [HttpPost("logout")]
+    public async Task<IActionResult> Logout()
+    {
+        try
+        {
+            var userId = GetCurrentUserId();
+            var user = await _context.Users.FindAsync(userId);
+
+            if (user == null)
+                return NotFound(new { message = "User not found" });
+
+            // Generate secure 6-digit verification code
+            var verificationCode = GenerateSecureCode(6);
+            var verificationCodeHash = HashCode(verificationCode);
+
+            // Create logout session with verification
+            var logoutSession = new LogoutSession
+            {
+                Id = Guid.NewGuid(),
+                UserId = userId,
+                Code = verificationCodeHash,
+                IpAddress = GetClientIp(),
+                UserAgent = Request.Headers["User-Agent"].ToString(),
+                CreatedAt = DateTime.UtcNow,
+                ExpiresAt = DateTime.UtcNow.AddHours(1),
+                IsVerified = false
+            };
+
+            _context.LogoutSessions.Add(logoutSession);
+
+            // Log logout activity
+            var userLog = new UserLog
+            {
+                Id = Guid.NewGuid(),
+                Action = "LOGOUT",
+                TargetUserId = userId,
+                TargetEmail = user.Email,
+                PerformedById = userId,
+                PerformedByEmail = user.Email,
+                Timestamp = DateTime.UtcNow
+            };
+            _context.UserLogs.Add(userLog);
+
+            await _context.SaveChangesAsync();
+
+            // Send logout verification email
+            await _emailService.SendLogoutVerificationEmailAsync(
+                user.Email,
+                user.Name,
+                verificationCode,
+                logoutSession.IpAddress ?? "Unknown",
+                logoutSession.UserAgent ?? "Unknown"
+            );
+
+            _logger.LogInformation($"User {user.Email} initiated logout with verification code sent");
+
+            return Ok(new
+            {
+                message = "Logout initiated. Verification code sent to your email.",
+                sessionId = logoutSession.Id,
+                expiresIn = 3600 // 1 hour in seconds
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error during logout");
+            return StatusCode(500, new { message = "Error during logout" });
+        }
+    }
+
+    /// <summary>
+    /// Verify logout with email code
+    /// Completes the logout process after email verification
+    /// </summary>
+    [HttpPost("verify-logout")]
+    public async Task<IActionResult> VerifyLogout([FromBody] VerifyLogoutRequest request)
+    {
+        try
+        {
+            // Find the logout session
+            var logoutSession = await _context.LogoutSessions
+                .Include(ls => ls.User)
+                .FirstOrDefaultAsync(ls => 
+                    ls.Id == request.SessionId && 
+                    !ls.IsVerified && 
+                    ls.ExpiresAt > DateTime.UtcNow);
+
+            if (logoutSession == null)
+                return BadRequest(new { message = "Invalid or expired logout session" });
+
+            // Verify the code
+            var isValidCode = VerifyCode(request.Code, logoutSession.Code);
+            if (!isValidCode)
+            {
+                _logger.LogWarning($"Invalid logout verification code attempt for session {request.SessionId}");
+                return BadRequest(new { message = "Incorrect verification code" });
+            }
+
+            // Mark session as verified
+            logoutSession.IsVerified = true;
+            logoutSession.VerifiedAt = DateTime.UtcNow;
+
+            // Optional: Invalidate all tokens for this user (implement token blacklist)
+            // await InvalidateUserTokensAsync(logoutSession.UserId);
+
+            await _context.SaveChangesAsync();
+
+            _logger.LogInformation($"Logout verified for user {logoutSession.User?.Email}");
+
+            return Ok(new
+            {
+                message = "Logout verified successfully. You have been logged out.",
+                verifiedAt = DateTime.UtcNow
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error verifying logout");
+            return StatusCode(500, new { message = "Error verifying logout" });
+        }
+    }
+
+    /// <summary>
+    /// Send email verification code
+    /// Used during registration or email change
+    /// </summary>
+    [HttpPost("send-email-verification")]
+    public async Task<IActionResult> SendEmailVerificationCode([FromBody] SendEmailVerificationRequest request)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(request.Email))
+                return BadRequest(new { message = "Email is required" });
+
+            // Check if email is already verified
+            var existingUser = await _context.Users.FirstOrDefaultAsync(u => u.Email == request.Email);
+            if (existingUser?.EmailVerified == true)
+                return BadRequest(new { message = "Email is already verified" });
+
+            // Generate 6-digit verification code
+            var verificationCode = GenerateSecureCode(6);
+            var verificationCodeHash = HashCode(verificationCode);
+
+            // Create email verification record
+            var emailVerification = new EmailVerification
+            {
+                Id = Guid.NewGuid(),
+                Email = request.Email,
+                Code = verificationCodeHash,
+                ExpiresAt = DateTime.UtcNow.AddMinutes(15),
+                IsUsed = false,
+                CreatedAt = DateTime.UtcNow,
+                UserId = existingUser?.Id
+            };
+
+            _context.EmailVerifications.Add(emailVerification);
+            await _context.SaveChangesAsync();
+
+            // Send verification email
+            await _emailService.SendEmailVerificationCodeAsync(request.Email, verificationCode, expiryMinutes: 15);
+
+            _logger.LogInformation($"Email verification code sent to {request.Email}");
+
+            return Ok(new
+            {
+                message = "Verification code sent to your email",
+                expiresIn = 900 // 15 minutes in seconds
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error sending email verification");
+            return StatusCode(500, new { message = "Error sending verification code" });
+        }
+    }
+
+    /// <summary>
+    /// Verify email with code
+    /// Completes email verification process
+    /// </summary>
+    [HttpPost("verify-email")]
+    public async Task<IActionResult> VerifyEmail([FromBody] VerifyEmailRequest request)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(request.Email) || string.IsNullOrWhiteSpace(request.Code))
+                return BadRequest(new { message = "Email and code are required" });
+
+            // Find the verification record
+            var emailVerification = await _context.EmailVerifications
+                .FirstOrDefaultAsync(ev => 
+                    ev.Email == request.Email && 
+                    !ev.IsUsed && 
+                    ev.ExpiresAt > DateTime.UtcNow);
+
+            if (emailVerification == null)
+                return BadRequest(new { message = "No active verification found for this email" });
+
+            // Verify the code
+            var isValidCode = VerifyCode(request.Code, emailVerification.Code);
+            if (!isValidCode)
+            {
+                _logger.LogWarning($"Invalid email verification code for {request.Email}");
+                return BadRequest(new { message = "Incorrect verification code" });
+            }
+
+            // Mark email as verified
+            var user = emailVerification.UserId.HasValue 
+                ? await _context.Users.FindAsync(emailVerification.UserId.Value)
+                : await _context.Users.FirstOrDefaultAsync(u => u.Email == request.Email);
+
+            if (user != null)
+            {
+                user.EmailVerified = true;
+                user.EmailVerifiedAt = DateTime.UtcNow;
+            }
+
+            // Mark verification as used
+            emailVerification.IsUsed = true;
+            emailVerification.VerifiedAt = DateTime.UtcNow;
+
+            await _context.SaveChangesAsync();
+
+            _logger.LogInformation($"Email verified for {request.Email}");
+
+            return Ok(new
+            {
+                message = "Email verified successfully",
+                verifiedAt = DateTime.UtcNow
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error verifying email");
+            return StatusCode(500, new { message = "Error verifying email" });
+        }
+    }
+
+    // ==================== Helper Methods ====================
+
+    /// <summary>
+    /// Generate a secure random code (e.g., 6-digit number)
+    /// </summary>
+    private string GenerateSecureCode(int length = 6)
+    {
+        using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
+        {
+            var tokenData = new byte[length];
+            rng.GetBytes(tokenData);
+            
+            if (length == 6)
+            {
+                // Generate 6-digit code (000000-999999)
+                var code = Math.Abs(BitConverter.ToInt32(tokenData, 0)) % 1000000;
+                return code.ToString("D6");
+            }
+            
+            // Fallback: Base64
+            return Convert.ToBase64String(tokenData).Substring(0, length).Replace("/", "0").Replace("+", "1");
+        }
+    }
+
+    /// <summary>
+    /// Hash a code using SHA256 for secure storage
+    /// </summary>
+    private string HashCode(string code)
+    {
+        using (var sha256 = System.Security.Cryptography.SHA256.Create())
+        {
+            var hashedBytes = sha256.ComputeHash(System.Text.Encoding.UTF8.GetBytes(code));
+            return Convert.ToBase64String(hashedBytes);
+        }
+    }
+
+    /// <summary>
+    /// Verify a code against its hash
+    /// </summary>
+    private bool VerifyCode(string code, string hash)
+    {
+        try
+        {
+            var codeHash = HashCode(code);
+            return codeHash == hash;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+}
+
+/// <summary>
+/// DTOs for logout and email verification
+/// </summary>
+public class LogoutSessionDto
+{
+    public Guid Id { get; set; }
+    public DateTime CreatedAt { get; set; }
+    public DateTime ExpiresAt { get; set; }
+    public bool IsVerified { get; set; }
+}
+
+public class VerifyLogoutRequest
+{
+    public Guid SessionId { get; set; }
+    public string Code { get; set; } = string.Empty;
+}
+
+public class SendEmailVerificationRequest
+{
+    public string Email { get; set; } = string.Empty;
+}
+
+public class VerifyEmailRequest
+{
+    public string Email { get; set; } = string.Empty;
+    public string Code { get; set; } = string.Empty;
 }

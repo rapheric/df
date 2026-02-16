@@ -62,6 +62,16 @@ public class User
     /// </summary>
     public bool IsMFARequired { get; set; } = false;
 
+    /// <summary>
+    /// Has the user email been verified
+    /// </summary>
+    public bool EmailVerified { get; set; } = false;
+
+    /// <summary>
+    /// When was the email verified
+    /// </summary>
+    public DateTime? EmailVerifiedAt { get; set; }
+
     // Navigation properties
     public ICollection<Checklist> CreatedChecklists { get; set; } = new List<Checklist>();
     public ICollection<Checklist> AssignedAsRM { get; set; } = new List<Checklist>();

@@ -40,6 +40,9 @@ public class ApplicationDbContext : DbContext
     public DbSet<SSOConnection> SSOConnections { get; set; }
     public DbSet<SSOLog> SSOLogs { get; set; }
 
+    // Email and Logout Verification Models
+    public DbSet<LogoutSession> LogoutSessions { get; set; }
+    public DbSet<EmailVerification> EmailVerifications { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
