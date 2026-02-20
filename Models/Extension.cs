@@ -15,6 +15,10 @@ public class Extension
     public string? CustomerName { get; set; }
     public string? CustomerNumber { get; set; }
     public string? DclNumber { get; set; }
+    public decimal? LoanAmount { get; set; }
+    public DateTime? NextDueDate { get; set; }
+    public DateTime? NextDocumentDueDate { get; set; }
+    public DateTime? SlaExpiry { get; set; }
 
     // Extension details
     [Required]
@@ -108,13 +112,13 @@ public class ExtensionApprover
     public User? User { get; set; }
 
     public string? Role { get; set; }
-    
+
     public ApproverApprovalStatus ApprovalStatus { get; set; } = ApproverApprovalStatus.Pending;
-    
+
     public DateTime? ApprovalDate { get; set; }
-    
+
     public string? ApprovalComment { get; set; }
-    
+
     public bool IsCurrent { get; set; } = false;
 }
 

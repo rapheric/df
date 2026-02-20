@@ -44,12 +44,27 @@ public class LoginResponse
     /// <summary>
     /// Session token for MFA verification (sent if MFA is required)
     /// </summary>
+    [System.Text.Json.Serialization.JsonPropertyName("mfaSessionToken")]
     public string? MFASessionToken { get; set; }
 
     /// <summary>
     /// Is MFA verification required
     /// </summary>
+    [System.Text.Json.Serialization.JsonPropertyName("isMFARequired")]
     public bool IsMFARequired { get; set; } = false;
+
+    /// <summary>
+    /// MFA method being used (EMAIL, TOTP, etc.)
+    /// </summary>
+    [System.Text.Json.Serialization.JsonPropertyName("mfaMethod")]
+    public string? MFAMethod { get; set; }
+
+    /// <summary>
+    /// (DEVELOPMENT ONLY) The actual MFA code for testing
+    /// This should NEVER be sent in production
+    /// </summary>
+    [System.Text.Json.Serialization.JsonPropertyName("devTestCode")]
+    public string? DevTestCode { get; set; }
 }
 
 public class UserResponse
@@ -94,3 +109,28 @@ public class LoginAuthDto
     public string Email { get; set; } = string.Empty;
     public string Password { get; set; } = string.Empty;
 }
+
+/// <summary>
+/// Email MFA verification request
+/// </summary>
+public class VerifyEmailMFARequest
+{
+    [Required]
+    [StringLength(255)]
+    public string SessionToken { get; set; } = string.Empty;
+
+    [Required]
+    [StringLength(6)]
+    public string Code { get; set; } = string.Empty;
+}
+
+/// <summary>
+/// Request to resend MFA code
+/// </summary>
+public class ResendMFACodeRequest
+{
+    [Required]
+    [StringLength(255)]
+    public string SessionToken { get; set; } = string.Empty;
+}
+

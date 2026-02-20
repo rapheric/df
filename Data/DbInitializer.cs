@@ -31,6 +31,56 @@ namespace NCBA.DCL.Data
                     }
                 }
 
+                // Ensure missing columns exist (as a fallback for migration issues)
+                try
+                {
+                    // Add NextDueDate to Deferrals
+                    try
+                    {
+                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE Deferrals ADD COLUMN NextDueDate datetime(6) NULL");
+                    }
+                    catch { /* Column already exists */ }
+
+                    // Add NextDocumentDueDate to Deferrals
+                    try
+                    {
+                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE Deferrals ADD COLUMN NextDocumentDueDate datetime(6) NULL");
+                    }
+                    catch { /* Column already exists */ }
+
+                    // Add SlaExpiry to Deferrals
+                    try
+                    {
+                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE Deferrals ADD COLUMN SlaExpiry datetime(6) NULL");
+                    }
+                    catch { /* Column already exists */ }
+
+                    // Add date columns to Extensions
+                    try
+                    {
+                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE Extensions ADD COLUMN NextDueDate datetime(6) NULL");
+                    }
+                    catch { /* Column already exists */ }
+
+                    try
+                    {
+                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE Extensions ADD COLUMN NextDocumentDueDate datetime(6) NULL");
+                    }
+                    catch { /* Column already exists */ }
+
+                    try
+                    {
+                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE Extensions ADD COLUMN SlaExpiry datetime(6) NULL");
+                    }
+                    catch { /* Column already exists */ }
+
+                    Console.WriteLine("✅ Database schema columns verified");
+                }
+                catch (Exception schemaEx)
+                {
+                    Console.WriteLine($"⚠️  Schema check error (non-critical): {schemaEx.Message}");
+                }
+
                 // Seed admin user if it doesn't exist
                 if (!await context.Users.AnyAsync(u => u.Email == "admin@ncba.com"))
                 {

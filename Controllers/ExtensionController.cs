@@ -42,7 +42,7 @@ public class ExtensionController : ControllerBase
         {
             var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
             var userName = User.FindFirst("name")?.Value ?? "User";
-            
+
             var deferral = await _context.Deferrals.FindAsync(request.DeferralId);
             if (deferral == null)
                 return NotFound(new { message = "Deferral not found" });
@@ -52,7 +52,7 @@ public class ExtensionController : ControllerBase
 
             if (deferral.DaysSought < 1)
                 return BadRequest(new { message = $"Deferral must have valid daysSought field (current value: {deferral.DaysSought})" });
-            
+
             if (request.RequestedDaysSought <= deferral.DaysSought)
                 return BadRequest(new { message = $"Requested days ({request.RequestedDaysSought}) must be greater than current days ({deferral.DaysSought})" });
 
@@ -64,6 +64,10 @@ public class ExtensionController : ControllerBase
                 CustomerName = deferral.CustomerName,
                 CustomerNumber = deferral.CustomerNumber,
                 DclNumber = deferral.DclNumber,
+                LoanAmount = deferral.LoanAmount,
+                NextDueDate = deferral.NextDueDate,
+                NextDocumentDueDate = deferral.NextDocumentDueDate,
+                SlaExpiry = deferral.SlaExpiry,
                 CurrentDaysSought = deferral.DaysSought,
                 RequestedDaysSought = request.RequestedDaysSought,
                 ExtensionReason = request.ExtensionReason,
@@ -141,9 +145,9 @@ public class ExtensionController : ControllerBase
                     try
                     {
                         await _emailService.SendExtensionApprovalRequestAsync(
-                            approverUser.Email, 
-                            approverUser.Name, 
-                            extension.DeferralNumber ?? "Unknown", 
+                            approverUser.Email,
+                            approverUser.Name,
+                            extension.DeferralNumber ?? "Unknown",
                             userName);
                     }
                     catch (Exception ex)
@@ -169,7 +173,7 @@ public class ExtensionController : ControllerBase
         try
         {
             var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
-            
+
             var extensions = await _context.Extensions
                 .Include(e => e.Deferral)
                 .Include(e => e.Approvers).ThenInclude(a => a.User)
@@ -200,14 +204,14 @@ public class ExtensionController : ControllerBase
         try
         {
             var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
-            
+
             var extensions = await _context.Extensions
                 .Include(e => e.Deferral)
                 .Include(e => e.Approvers).ThenInclude(a => a.User)
                 .Include(e => e.RequestedBy)
-                .Where(e => e.Approvers.Any(a => 
-                    a.UserId == userId && 
-                    a.IsCurrent == true && 
+                .Where(e => e.Approvers.Any(a =>
+                    a.UserId == userId &&
+                    a.IsCurrent == true &&
                     a.ApprovalStatus == ApproverApprovalStatus.Pending))
                 .OrderByDescending(e => e.CreatedAt)
                 .ToListAsync();
@@ -228,13 +232,13 @@ public class ExtensionController : ControllerBase
         try
         {
             var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
-            
+
             var extensions = await _context.Extensions
                 .Include(e => e.Deferral)
                 .Include(e => e.Approvers).ThenInclude(a => a.User)
                 .Include(e => e.RequestedBy)
-                .Where(e => e.Approvers.Any(a => 
-                    a.UserId == userId && 
+                .Where(e => e.Approvers.Any(a =>
+                    a.UserId == userId &&
                     a.ApprovalStatus != ApproverApprovalStatus.Pending))
                 .OrderByDescending(e => e.CreatedAt)
                 .ToListAsync();
@@ -255,7 +259,7 @@ public class ExtensionController : ControllerBase
         try
         {
             var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
-            
+
             var extension = await _context.Extensions
                 .Include(e => e.Approvers)
                 .Include(e => e.History)
@@ -320,7 +324,7 @@ public class ExtensionController : ControllerBase
         try
         {
             var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
-            
+
             var extension = await _context.Extensions
                 .Include(e => e.Approvers)
                 .Include(e => e.History)
@@ -402,7 +406,7 @@ public class ExtensionController : ControllerBase
         try
         {
             var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
-            
+
             var extension = await _context.Extensions
                 .Include(e => e.History)
                 .FirstOrDefaultAsync(e => e.Id == id);
@@ -444,7 +448,7 @@ public class ExtensionController : ControllerBase
         try
         {
             var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
-            
+
             var extension = await _context.Extensions
                 .Include(e => e.History)
                 .FirstOrDefaultAsync(e => e.Id == id);
@@ -515,7 +519,7 @@ public class ExtensionController : ControllerBase
         try
         {
             var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
-            
+
             var extension = await _context.Extensions
                 .Include(e => e.History)
                 .Include(e => e.Deferral)
@@ -566,7 +570,7 @@ public class ExtensionController : ControllerBase
         try
         {
             var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
-            
+
             var extension = await _context.Extensions
                 .Include(e => e.History)
                 .FirstOrDefaultAsync(e => e.Id == id);

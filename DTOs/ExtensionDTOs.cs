@@ -21,6 +21,10 @@ public class ExtensionResponse
     public string? CustomerName { get; set; }
     public string? CustomerNumber { get; set; }
     public string? DclNumber { get; set; }
+    public decimal? LoanAmount { get; set; }
+    public DateTime? NextDueDate { get; set; }
+    public DateTime? NextDocumentDueDate { get; set; }
+    public DateTime? SlaExpiry { get; set; }
     public int CurrentDaysSought { get; set; }
     public int RequestedDaysSought { get; set; }
     public string ExtensionReason { get; set; } = string.Empty;

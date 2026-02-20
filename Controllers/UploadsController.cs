@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using NCBA.DCL.Data;
 using NCBA.DCL.Models;
+using NCBA.DCL.DTOs;
 using Microsoft.EntityFrameworkCore;
 
 namespace NCBA.DCL.Controllers;
@@ -47,6 +48,9 @@ public class UploadsController : ControllerBase
                 fileData = stream.ToArray();
             }
 
+            // Get user's role from claims
+            var role = User?.FindFirst("role")?.Value ?? User?.FindFirst("http://schemas.microsoft.com/ws/2008/06/identity/claims/role")?.Value ?? "RM";
+
             var upload = new Upload
             {
                 Id = Guid.NewGuid(),
@@ -61,6 +65,7 @@ public class UploadsController : ControllerBase
                 FileSize = dto.File.Length,
                 FileType = dto.File.ContentType,
                 UploadedBy = User?.Identity?.Name ?? "RM",
+                UploadedByRole = role,
                 Status = "active",
                 CreatedAt = DateTime.UtcNow,
                 UpdatedAt = DateTime.UtcNow
@@ -74,26 +79,26 @@ public class UploadsController : ControllerBase
             _context.Uploads.Update(upload);
             await _context.SaveChangesAsync();
 
-            return StatusCode(201, new
+            // Map to response DTO (excludes FileData)
+            var response = new UploadResponseDto
             {
-                success = true,
-                data = new
-                {
-                    _id = upload.Id,
-                    checklistId = upload.ChecklistId,
-                    documentId = upload.DocumentId,
-                    documentName = upload.DocumentName,
-                    category = upload.Category,
-                    fileName = upload.FileName,
-                    fileUrl = upload.FileUrl,
-                    fileSize = upload.FileSize,
-                    fileType = upload.FileType,
-                    uploadedBy = upload.UploadedBy,
-                    status = upload.Status,
-                    createdAt = upload.CreatedAt,
-                    updatedAt = upload.UpdatedAt
-                }
-            });
+                Id = upload.Id,
+                ChecklistId = upload.ChecklistId,
+                DocumentId = upload.DocumentId,
+                DocumentName = upload.DocumentName,
+                Category = upload.Category,
+                FileName = upload.FileName,
+                FileUrl = upload.FileUrl,
+                FileSize = upload.FileSize,
+                FileType = upload.FileType,
+                UploadedBy = upload.UploadedBy,
+                UploadedByRole = upload.UploadedByRole,
+                Status = upload.Status,
+                CreatedAt = upload.CreatedAt,
+                UpdatedAt = upload.UpdatedAt
+            };
+
+            return StatusCode(201, new { success = true, data = response });
         }
         catch (Exception ex)
         {
@@ -127,11 +132,54 @@ public class UploadsController : ControllerBase
     [HttpGet("checklist/{checklistId}")]
     public async Task<IActionResult> GetByChecklist(Guid checklistId)
     {
+        // Fetch from Upload table
         var uploads = await _context.Uploads
-            .Where(u => u.ChecklistId == checklistId && u.Status == "active")
+            .Where(u => u.ChecklistId == checklistId)
             .ToListAsync();
 
-        return Ok(new { success = true, data = uploads });
+        // Fetch from SupportingDoc table (RM uploads)
+        var supportingDocs = await _context.SupportingDocs
+            .Where(s => s.ChecklistId == checklistId)
+            .ToListAsync();
+
+        // Map Upload table to response DTOs
+        var uploadResponses = uploads.Select(u => new UploadResponseDto
+        {
+            Id = u.Id,
+            ChecklistId = u.ChecklistId,
+            DocumentId = u.DocumentId,
+            DocumentName = u.DocumentName,
+            Category = u.Category,
+            FileName = u.FileName,
+            FileUrl = u.FileUrl,
+            FileSize = u.FileSize,
+            FileType = u.FileType,
+            UploadedBy = u.UploadedBy,
+            UploadedByRole = u.UploadedByRole,
+            Status = u.Status,
+            CreatedAt = u.CreatedAt,
+            UpdatedAt = u.UpdatedAt
+        }).ToList();
+
+        // Map SupportingDoc table to response DTOs
+        var supportingResponses = supportingDocs.Select(s => new UploadResponseDto
+        {
+            Id = s.Id,
+            ChecklistId = s.ChecklistId,
+            FileName = s.FileName,
+            FileUrl = s.FileUrl,
+            FileSize = s.FileSize,
+            FileType = s.FileType,
+            UploadedByRole = s.UploadedByRole,
+            Status = "active",
+            CreatedAt = s.UploadedAt,
+            UpdatedAt = s.UploadedAt
+        }).ToList();
+
+        // Combine both sources
+        var allDocs = uploadResponses.Concat(supportingResponses).ToList();
+
+        return Ok(new { success = true, data = allDocs });
     }
 
     [HttpDelete("{id}")]

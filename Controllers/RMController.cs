@@ -82,6 +82,7 @@ public class RMController : ControllerBase
                 .Include(c => c.AssignedToRM)
                 .Include(c => c.Documents)
                     .ThenInclude(dc => dc.DocList)
+                .Include(c => c.SupportingDocs)
                 .OrderByDescending(c => c.CreatedAt)
                 .Select(c => new
                 {
@@ -108,6 +109,17 @@ public class RMController : ControllerBase
                             comment = d.Comment,
                             deferralNumber = d.DeferralNumber
                         }).ToList()
+                    }).ToList(),
+                    supportingDocs = c.SupportingDocs.Select(sd => new
+                    {
+                        id = sd.Id,
+                        fileName = sd.FileName,
+                        fileUrl = sd.FileUrl,
+                        fileSize = sd.FileSize,
+                        fileType = sd.FileType,
+                        uploadedById = sd.UploadedById,
+                        uploadedByRole = sd.UploadedByRole,
+                        uploadedAt = sd.UploadedAt
                     }).ToList(),
                     createdAt = c.CreatedAt,
                     updatedAt = c.UpdatedAt

@@ -125,9 +125,17 @@ public class Deferral
 
     public string? LoanType { get; set; }
 
+    public decimal? LoanAmount { get; set; }
+
     public int DaysSought { get; set; }
 
     public string? DclNumber { get; set; }
+
+    public DateTime? NextDueDate { get; set; }
+
+    public DateTime? NextDocumentDueDate { get; set; }
+
+    public DateTime? SlaExpiry { get; set; }
 
     public DeferralStatus Status { get; set; } = DeferralStatus.Pending;
 

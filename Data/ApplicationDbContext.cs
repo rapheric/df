@@ -43,6 +43,7 @@ public class ApplicationDbContext : DbContext
     // Email and Logout Verification Models
     public DbSet<LogoutSession> LogoutSessions { get; set; }
     public DbSet<EmailVerification> EmailVerifications { get; set; }
+    public DbSet<EmailMFACode> EmailMFACodes { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

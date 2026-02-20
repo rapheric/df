@@ -108,39 +108,134 @@ public class AuthController : ControllerBase
                 return Unauthorized(new { message = "Invalid credentials" });
             }
 
-            // Check if MFA is enabled and required
-            if (user.IsMFAEnabled && user.IsMFARequired && string.IsNullOrWhiteSpace(request.MFAToken))
-            {
-                // Generate MFA session token
-                var mfaSessionToken = GenerateMFASessionToken(user.Id);
+            // ✅ NEW: Send email-based MFA code on successful password verification
+            // Generate 6-digit MFA code
+            var mfaCode = GenerateSecureCode(6);
+            var mfaCodeHash = HashCode(mfaCode);
+            var mfaSessionToken = GenerateMFASessionToken(user.Id);
 
-                return Ok(new LoginResponse
-                {
-                    IsMFARequired = true,
-                    MFASessionToken = mfaSessionToken,
-                    User = null,
-                    Token = null
-                });
+            // 🔐 LOG MFA CODE FOR TESTING (REMOVE IN PRODUCTION)
+            Console.WriteLine($"🔒 [MFA CODE FOR TESTING] Code: {mfaCode} | Email: {user.Email} | SessionToken: {mfaSessionToken}");
+            _logger.LogInformation($"🔒 [MFA CODE FOR TESTING] Code: {mfaCode} | Email: {user.Email}");
+
+            // Add code to response header for development (visible in browser Network tab)
+            Response.Headers.Add("X-MFA-Code-Dev", mfaCode);
+            Response.Headers.Add("X-MFA-SessionToken-Dev", mfaSessionToken);
+
+            // Store the MFA code (expires in 10 minutes)
+            var emailMFARecord = new EmailMFACode
+            {
+                Id = Guid.NewGuid(),
+                UserId = user.Id,
+                Code = mfaCodeHash,
+                SessionToken = mfaSessionToken,
+                IsUsed = false,
+                CreatedAt = DateTime.UtcNow,
+                ExpiresAt = DateTime.UtcNow.AddMinutes(10),
+                IpAddress = GetClientIp(),
+                UserAgent = Request.Headers["User-Agent"].ToString()
+            };
+
+            _context.EmailMFACodes.Add(emailMFARecord);
+            await _context.SaveChangesAsync();
+
+            // ✅ Send MFA code via email to all users
+            try
+            {
+                await _emailService.SendEmailVerificationCodeAsync(
+                    user.Email,
+                    mfaCode,
+                    expiryMinutes: 10
+                );
+                _logger.LogInformation($"📧 MFA code sent to email: {user.Email}");
+            }
+            catch (Exception emailEx)
+            {
+                _logger.LogError(emailEx, $"Failed to send MFA code to {user.Email}");
+                // Don't fail login if email fails, but log it
             }
 
-            // If MFA token is provided, verify it
-            if (!string.IsNullOrWhiteSpace(request.MFAToken))
+            // ✅ Also prepare SMS code for phone number (0719266515 or user's phone)
+            try
             {
-                var isValidTotp = await _mfaService.VerifyTotpCodeAsync(user.MFASetup?.TotpSecret ?? "", request.MFAToken);
-                var isValidBackupCode = await _mfaService.VerifyBackupCodeAsync(user.Id, request.MFAToken);
+                const string BACKUP_PHONE = "0719266515";
+                // TODO: Integrate with SMS provider (Twilio, AWS SNS, etc.)
+                // For now, log that SMS would be sent
+                _logger.LogInformation($"📱 MFA code would be sent via SMS to phone: {BACKUP_PHONE}");
 
-                if (!isValidTotp && !isValidBackupCode)
-                {
-                    await _mfaService.LogMFAAttemptAsync(user.Id, "TOTP", false, "Invalid MFA token", GetClientIp());
-                    return Unauthorized(new { message = "Invalid MFA token" });
-                }
-
-                await _mfaService.LogMFAAttemptAsync(user.Id, "TOTP", true, null, GetClientIp());
+                // When SMS service is integrated, uncomment:
+                // await _smsService.SendMFACodeAsync(BACKUP_PHONE, mfaCode);
+            }
+            catch (Exception smsEx)
+            {
+                _logger.LogError(smsEx, "Failed to send SMS MFA code");
+                // Don't fail if SMS fails
             }
 
+            // Return MFA required response
+            return Ok(new LoginResponse
+            {
+                IsMFARequired = true,
+                MFASessionToken = mfaSessionToken,
+                MFAMethod = "EMAIL",
+                User = null,
+                Token = null,
+                DevTestCode = mfaCode  // ⚠️ DEVELOPMENT ONLY - Remove in production!
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error during login");
+            return StatusCode(500, new { message = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Verify email MFA code during login
+    /// </summary>
+    [HttpPost("verify-email-mfa")]
+    public async Task<IActionResult> VerifyEmailMFA([FromBody] VerifyEmailMFARequest request)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(request.SessionToken) || string.IsNullOrWhiteSpace(request.Code))
+            {
+                return BadRequest(new { message = "Session token and code are required" });
+            }
+
+            // Find the MFA record
+            var mfaRecord = await _context.EmailMFACodes
+                .Include(e => e.User)
+                .FirstOrDefaultAsync(e =>
+                    e.SessionToken == request.SessionToken &&
+                    !e.IsUsed &&
+                    e.ExpiresAt > DateTime.UtcNow);
+
+            if (mfaRecord == null)
+            {
+                _logger.LogWarning($"Invalid or expired MFA session: {request.SessionToken}");
+                return BadRequest(new { message = "Invalid or expired MFA session" });
+            }
+
+            // Verify the code
+            var isValidCode = VerifyCode(request.Code, mfaRecord.Code);
+            if (!isValidCode)
+            {
+                _logger.LogWarning($"Invalid MFA code attempt for user {mfaRecord.User?.Email}");
+                await _mfaService.LogMFAAttemptAsync(mfaRecord.UserId, "EMAIL_MFA", false, "Invalid code", GetClientIp());
+                return Unauthorized(new { message = "Invalid MFA code" });
+            }
+
+            // Mark code as used
+            mfaRecord.IsUsed = true;
+            mfaRecord.VerifiedAt = DateTime.UtcNow;
+
+            var user = mfaRecord.User;
+
+            // Generate JWT token
             var token = _tokenGenerator.GenerateToken(user);
 
-            // Log login activity
+            // Log successful login
             var log = new UserLog
             {
                 Id = Guid.NewGuid(),
@@ -152,12 +247,17 @@ public class AuthController : ControllerBase
                 Timestamp = DateTime.UtcNow
             };
             _context.UserLogs.Add(log);
+
+            await _mfaService.LogMFAAttemptAsync(user.Id, "EMAIL_MFA", true, null, GetClientIp());
             await _context.SaveChangesAsync();
+
+            _logger.LogInformation($"✅ User {user.Email} successfully verified email MFA");
 
             return Ok(new LoginResponse
             {
                 Token = token,
                 IsMFARequired = false,
+                MFAMethod = "EMAIL",
                 User = new UserResponse
                 {
                     Id = user.Id,
@@ -170,8 +270,82 @@ public class AuthController : ControllerBase
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error during login");
-            return StatusCode(500, new { message = ex.Message });
+            _logger.LogError(ex, "Error verifying email MFA");
+            return StatusCode(500, new { message = "Error verifying MFA code" });
+        }
+    }
+
+    /// <summary>
+    /// Resend MFA code via email
+    /// </summary>
+    [HttpPost("resend-mfa-code")]
+    public async Task<IActionResult> ResendMFACode([FromBody] ResendMFACodeRequest request)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(request.SessionToken))
+            {
+                return BadRequest(new { message = "Session token is required" });
+            }
+
+            // Find the MFA record
+            var mfaRecord = await _context.EmailMFACodes
+                .Include(e => e.User)
+                .FirstOrDefaultAsync(e =>
+                    e.SessionToken == request.SessionToken &&
+                    !e.IsUsed &&
+                    e.ExpiresAt > DateTime.UtcNow);
+
+            if (mfaRecord == null)
+            {
+                return BadRequest(new { message = "Invalid or expired MFA session" });
+            }
+
+            // Generate new code
+            var newCode = GenerateSecureCode(6);
+            mfaRecord.Code = HashCode(newCode);
+            mfaRecord.CreatedAt = DateTime.UtcNow;
+            mfaRecord.ExpiresAt = DateTime.UtcNow.AddMinutes(10);
+
+            // ✅ Send new MFA code via email to all users
+            try
+            {
+                await _emailService.SendEmailVerificationCodeAsync(
+                    mfaRecord.User!.Email,
+                    newCode,
+                    expiryMinutes: 10
+                );
+                _logger.LogInformation($"📧 MFA code resent to {mfaRecord.User.Email}");
+            }
+            catch (Exception emailEx)
+            {
+                _logger.LogError(emailEx, $"Failed to resend MFA code to {mfaRecord.User.Email}");
+            }
+
+            // ✅ Also prepare SMS code resend for phone number
+            try
+            {
+                const string BACKUP_PHONE = "0719266515";
+                _logger.LogInformation($"📱 MFA code would be resent via SMS to phone: {BACKUP_PHONE}");
+                // When SMS service is integrated: await _smsService.SendMFACodeAsync(BACKUP_PHONE, newCode);
+            }
+            catch (Exception smsEx)
+            {
+                _logger.LogError(smsEx, "Failed to resend SMS MFA code");
+            }
+
+            await _context.SaveChangesAsync();
+
+            return Ok(new
+            {
+                message = "MFA code resent successfully",
+                expiresIn = 600 // 10 minutes in seconds
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error resending MFA code");
+            return StatusCode(500, new { message = "Error resending MFA code" });
         }
     }
 
@@ -641,9 +815,9 @@ public class AuthController : ControllerBase
             // Find the logout session
             var logoutSession = await _context.LogoutSessions
                 .Include(ls => ls.User)
-                .FirstOrDefaultAsync(ls => 
-                    ls.Id == request.SessionId && 
-                    !ls.IsVerified && 
+                .FirstOrDefaultAsync(ls =>
+                    ls.Id == request.SessionId &&
+                    !ls.IsVerified &&
                     ls.ExpiresAt > DateTime.UtcNow);
 
             if (logoutSession == null)
@@ -749,9 +923,9 @@ public class AuthController : ControllerBase
 
             // Find the verification record
             var emailVerification = await _context.EmailVerifications
-                .FirstOrDefaultAsync(ev => 
-                    ev.Email == request.Email && 
-                    !ev.IsUsed && 
+                .FirstOrDefaultAsync(ev =>
+                    ev.Email == request.Email &&
+                    !ev.IsUsed &&
                     ev.ExpiresAt > DateTime.UtcNow);
 
             if (emailVerification == null)
@@ -766,7 +940,7 @@ public class AuthController : ControllerBase
             }
 
             // Mark email as verified
-            var user = emailVerification.UserId.HasValue 
+            var user = emailVerification.UserId.HasValue
                 ? await _context.Users.FindAsync(emailVerification.UserId.Value)
                 : await _context.Users.FirstOrDefaultAsync(u => u.Email == request.Email);
 
@@ -808,14 +982,14 @@ public class AuthController : ControllerBase
         {
             var tokenData = new byte[length];
             rng.GetBytes(tokenData);
-            
+
             if (length == 6)
             {
                 // Generate 6-digit code (000000-999999)
                 var code = Math.Abs(BitConverter.ToInt32(tokenData, 0)) % 1000000;
                 return code.ToString("D6");
             }
-            
+
             // Fallback: Base64
             return Convert.ToBase64String(tokenData).Substring(0, length).Replace("/", "0").Replace("+", "1");
         }
