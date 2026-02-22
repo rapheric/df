@@ -125,6 +125,7 @@ public class Deferral
 
     public string? LoanType { get; set; }
 
+    [NotMapped]
     public decimal? LoanAmount { get; set; }
 
     public int DaysSought { get; set; }

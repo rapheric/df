@@ -1205,6 +1205,30 @@ public class DeferralController : ControllerBase
                 _logger.LogWarning(emailEx, "⚠️ Deferral approved but failed to notify next approver for {DeferralNumber}", deferral.DeferralNumber);
             }
 
+            // Notify RM that an approver has approved and where the deferral moved next
+            try
+            {
+                var rm = deferral.CreatedBy;
+                if (rm != null && !string.IsNullOrWhiteSpace(rm.Email))
+                {
+                    var rmName = string.IsNullOrWhiteSpace(rm.Name) ? "Relationship Manager" : rm.Name;
+                    await _emailService.SendDeferralApprovedToRmAsync(
+                        rm.Email,
+                        rmName,
+                        deferral.DeferralNumber,
+                        string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                        nextApprover?.Name ?? nextApprover?.User?.Name,
+                        !hasNextApprover
+                    );
+                }
+            }
+            catch (Exception rmEmailEx)
+            {
+                _logger.LogWarning(rmEmailEx, "⚠️ Deferral approved but failed to notify RM for {DeferralNumber}", deferral.DeferralNumber);
+            }
+
+            
+
             _logger.LogInformation($"✅ Deferral {deferral.DeferralNumber} approved by {userId}");
 
             return Ok(new

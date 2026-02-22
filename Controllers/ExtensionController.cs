@@ -40,7 +40,9 @@ public class ExtensionController : ControllerBase
     {
         try
         {
-            var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
+            var idClaim = User.FindFirst("id")?.Value;
+            if (!Guid.TryParse(idClaim, out var userId))
+                return StatusCode(401, new { message = "Invalid or missing user id claim" });
             var userName = User.FindFirst("name")?.Value ?? "User";
 
             var deferral = await _context.Deferrals.FindAsync(request.DeferralId);
@@ -64,7 +66,6 @@ public class ExtensionController : ControllerBase
                 CustomerName = deferral.CustomerName,
                 CustomerNumber = deferral.CustomerNumber,
                 DclNumber = deferral.DclNumber,
-                LoanAmount = deferral.LoanAmount,
                 NextDueDate = deferral.NextDueDate,
                 NextDocumentDueDate = deferral.NextDocumentDueDate,
                 SlaExpiry = deferral.SlaExpiry,
@@ -107,7 +108,7 @@ public class ExtensionController : ControllerBase
                 extension.Approvers.Add(new ExtensionApprover
                 {
                     UserId = approver.UserId,
-                    User = approver.User, // Ensure User is linked if available
+                    // Do not assign the tracked User entity here; only set UserId to avoid EF tracking/insert conflicts
                     Role = approver.Role,
                     ApprovalStatus = ApproverApprovalStatus.Pending,
                     IsCurrent = false
@@ -162,7 +163,8 @@ public class ExtensionController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error creating extension");
-            return StatusCode(500, new { message = "Internal server error" });
+            var inner = ex.InnerException?.Message;
+            return StatusCode(500, new { message = "Internal server error", error = ex.Message, detail = inner });
         }
     }
 
@@ -172,7 +174,9 @@ public class ExtensionController : ControllerBase
     {
         try
         {
-            var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
+            var idClaim = User.FindFirst("id")?.Value;
+            if (!Guid.TryParse(idClaim, out var userId))
+                return StatusCode(401, new { message = "Invalid or missing user id claim" });
 
             var extensions = await _context.Extensions
                 .Include(e => e.Deferral)
@@ -189,7 +193,7 @@ public class ExtensionController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error getting my extensions");
-            return StatusCode(500, new { message = "Internal server error" });
+            return StatusCode(500, new { message = "Internal server error", error = ex.Message });
         }
     }
 
@@ -203,7 +207,9 @@ public class ExtensionController : ControllerBase
     {
         try
         {
-            var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
+            var idClaim = User.FindFirst("id")?.Value;
+            if (!Guid.TryParse(idClaim, out var userId))
+                return StatusCode(401, new { message = "Invalid or missing user id claim" });
 
             var extensions = await _context.Extensions
                 .Include(e => e.Deferral)
@@ -231,7 +237,9 @@ public class ExtensionController : ControllerBase
     {
         try
         {
-            var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
+            var idClaim = User.FindFirst("id")?.Value;
+            if (!Guid.TryParse(idClaim, out var userId))
+                return StatusCode(401, new { message = "Invalid or missing user id claim" });
 
             var extensions = await _context.Extensions
                 .Include(e => e.Deferral)
@@ -258,7 +266,9 @@ public class ExtensionController : ControllerBase
     {
         try
         {
-            var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
+            var idClaim = User.FindFirst("id")?.Value;
+            if (!Guid.TryParse(idClaim, out var userId))
+                return StatusCode(401, new { message = "Invalid or missing user id claim" });
 
             var extension = await _context.Extensions
                 .Include(e => e.Approvers)
@@ -323,7 +333,9 @@ public class ExtensionController : ControllerBase
     {
         try
         {
-            var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
+            var idClaim = User.FindFirst("id")?.Value;
+            if (!Guid.TryParse(idClaim, out var userId))
+                return StatusCode(401, new { message = "Invalid or missing user id claim" });
 
             var extension = await _context.Extensions
                 .Include(e => e.Approvers)
@@ -405,7 +417,9 @@ public class ExtensionController : ControllerBase
     {
         try
         {
-            var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
+            var idClaim = User.FindFirst("id")?.Value;
+            if (!Guid.TryParse(idClaim, out var userId))
+                return StatusCode(401, new { message = "Invalid or missing user id claim" });
 
             var extension = await _context.Extensions
                 .Include(e => e.History)

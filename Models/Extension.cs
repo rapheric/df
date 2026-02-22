@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
 
 namespace NCBA.DCL.Models;
 
@@ -15,6 +16,7 @@ public class Extension
     public string? CustomerName { get; set; }
     public string? CustomerNumber { get; set; }
     public string? DclNumber { get; set; }
+    [NotMapped]
     public decimal? LoanAmount { get; set; }
     public DateTime? NextDueDate { get; set; }
     public DateTime? NextDocumentDueDate { get; set; }
