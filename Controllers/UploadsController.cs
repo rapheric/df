@@ -170,6 +170,7 @@ public class UploadsController : ControllerBase
             FileUrl = s.FileUrl,
             FileSize = s.FileSize,
             FileType = s.FileType,
+            UploadedBy = s.UploadedBy?.Name ?? "Unknown",
             UploadedByRole = s.UploadedByRole,
             Status = "active",
             CreatedAt = s.UploadedAt,

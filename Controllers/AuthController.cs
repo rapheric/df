@@ -305,7 +305,7 @@ public class AuthController : ControllerBase
             var newCode = GenerateSecureCode(6);
             mfaRecord.Code = HashCode(newCode);
             mfaRecord.CreatedAt = DateTime.UtcNow;
-            mfaRecord.ExpiresAt = DateTime.UtcNow.AddMinutes(10);
+            mfaRecord.ExpiresAt = DateTime.UtcNow.AddMinutes(5);
 
             // ✅ Send new MFA code via email to all users
             try
@@ -313,7 +313,7 @@ public class AuthController : ControllerBase
                 await _emailService.SendEmailVerificationCodeAsync(
                     mfaRecord.User!.Email,
                     newCode,
-                    expiryMinutes: 10
+                    expiryMinutes: 5
                 );
                 _logger.LogInformation($"📧 MFA code resent to {mfaRecord.User.Email}");
             }

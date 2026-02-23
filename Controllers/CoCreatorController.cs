@@ -2045,13 +2045,18 @@ public class CoCreatorController : ControllerBase
         }
     }
 
-    // POST /api/cocreatorChecklist/:id/upload
+    // POST /api/cocreatorChecklist/:id/upload - Accepts both single file and multiple files
     [HttpPost("{id}/upload")]
-
-    public async Task<IActionResult> UploadSupportingDocs(Guid id, List<IFormFile> files)
+    public async Task<IActionResult> UploadSupportingDocs(Guid id, IFormFile? file, [FromForm] List<IFormFile>? files)
     {
         try
         {
+            // Handle single file upload
+            if (file != null && file.Length > 0)
+            {
+                files = new List<IFormFile> { file };
+            }
+
             if (files == null || files.Count == 0)
             {
                 return BadRequest(new { message = "No files provided" });
@@ -2074,19 +2079,19 @@ public class CoCreatorController : ControllerBase
             var uploadsPath = Path.Combine(_environment.ContentRootPath, "uploads", id.ToString());
             var uploadedDocs = new List<object>();
 
-            foreach (var file in files)
+            foreach (var f in files)
             {
-                var fileName = await FileUploadHelper.SaveFileAsync(file, uploadsPath);
+                var fileName = await FileUploadHelper.SaveFileAsync(f, uploadsPath);
                 var fileUrl = $"/uploads/{id}/{fileName}";
 
                 // Create SupportingDoc entity in the database
                 var supportingDoc = new SupportingDoc
                 {
                     Id = Guid.NewGuid(),
-                    FileName = file.FileName,
+                    FileName = f.FileName,
                     FileUrl = fileUrl,
-                    FileSize = file.Length,
-                    FileType = file.ContentType,
+                    FileSize = f.Length,
+                    FileType = f.ContentType,
                     UploadedById = userId,
                     UploadedByRole = userRole,
                     UploadedAt = DateTime.UtcNow,
