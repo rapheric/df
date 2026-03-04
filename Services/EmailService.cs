@@ -228,6 +228,26 @@ public class EmailService : IEmailService
             </html>";
     }
 
+    private string GetDeferralApprovedToRmHtml(string userName, string deferralNumber, string customerName, string? nextApproverName, bool isFinalApproval)
+    {
+        var nextStep = isFinalApproval
+            ? "This was the final approval step. The deferral is now fully approved and will proceed to completion."
+            : $"The deferral has moved to the next approver: <strong>{(string.IsNullOrWhiteSpace(nextApproverName) ? "Next Approver" : nextApproverName)}</strong>.";
+
+        return $@"
+            <html>
+                <body style=""font-family: Arial, sans-serif; color: #333;"">
+                    <h2>Deferral Update</h2>
+                    <p>Hello {userName},</p>
+                    <p>An approver has recorded an approval for deferral <strong>{deferralNumber}</strong> for customer <strong>{customerName}</strong>.</p>
+                    <p>{nextStep}</p>
+                    <p>Please log in to the system to view details and next steps.</p>
+                    <hr>
+                    <p>This is an automated email. Please do not reply.</p>
+                </body>
+            </html>";
+    }
+
     private string GetDeferralRejectedToRmHtml(string userName, string deferralNumber, string customerName, string rejectionReason, string rejectedByName)
     {
         return $@"
@@ -470,6 +490,16 @@ public class EmailService : IEmailService
             ? $"Confirmation: Final Approval Recorded for {deferralNumber}"
             : $"Confirmation: You Approved {deferralNumber}";
         var htmlBody = GetDeferralApprovalConfirmationHtml(userName, deferralNumber, customerName, nextApproverName, isFinalApproval);
+        await SendEmailAsync(toEmail, subject, htmlBody);
+    }
+
+    public async Task SendDeferralApprovedToRmAsync(string toEmail, string userName, string deferralNumber, string customerName, string? nextApproverName, bool isFinalApproval)
+    {
+        var subject = isFinalApproval
+            ? $"Deferral Approved: Final Approval Recorded for {deferralNumber}"
+            : $"Deferral Update: {deferralNumber} moved to next approver";
+
+        var htmlBody = GetDeferralApprovedToRmHtml(userName, deferralNumber, customerName, nextApproverName, isFinalApproval);
         await SendEmailAsync(toEmail, subject, htmlBody);
     }
 
