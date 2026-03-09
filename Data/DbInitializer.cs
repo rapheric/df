@@ -74,6 +74,27 @@ namespace NCBA.DCL.Data
                     }
                     catch { /* Column already exists */ }
 
+                    // Add missing DaysSought column to Deferrals (safeguard for older schemas)
+                    try
+                    {
+                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE Deferrals ADD COLUMN DaysSought int NOT NULL DEFAULT 0");
+                    }
+                    catch { /* Column already exists or cannot be added */ }
+
+                    // Add missing DaysSought column to DeferralDocuments (per-document metadata)
+                    try
+                    {
+                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE DeferralDocuments ADD COLUMN DaysSought int NULL");
+                    }
+                    catch { /* Column already exists or cannot be added */ }
+
+                    // Add NextDocumentDueDate to DeferralDocuments (per-document metadata)
+                    try
+                    {
+                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE DeferralDocuments ADD COLUMN NextDocumentDueDate datetime(6) NULL");
+                    }
+                    catch { /* Column already exists or cannot be added */ }
+
                     Console.WriteLine("✅ Database schema columns verified");
                 }
                 catch (Exception schemaEx)

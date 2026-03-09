@@ -236,6 +236,11 @@ public class DeferralDocument
 
     public Guid DeferralId { get; set; }
     public Deferral Deferral { get; set; } = null!;
+
+    // Per-document deferral metadata
+    public int? DaysSought { get; set; }
+
+    public DateTime? NextDocumentDueDate { get; set; }
 }
 
 public class Approver

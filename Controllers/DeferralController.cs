@@ -79,14 +79,17 @@ public class DeferralController : ControllerBase
                 });
             }
 
-            if (request.Approvers.Any(a => (a.UserId ?? a.User) == null))
+            // Parse approver identifiers robustly (accept Guid values or string GUIDs)
+            var approverUserIds = new List<Guid>();
+            foreach (var a in request.Approvers)
             {
-                return BadRequest(new { error = "All approver slots must be assigned to a user" });
+                var parsed = TryGetGuidFromClientValue(a.UserId) ?? TryGetGuidFromClientValue(a.User);
+                if (!parsed.HasValue)
+                {
+                    return BadRequest(new { error = "All approver slots must be assigned to a valid user GUID" });
+                }
+                approverUserIds.Add(parsed.Value);
             }
-
-            var approverUserIds = request.Approvers
-                .Select(a => (a.UserId ?? a.User)!.Value)
-                .ToList();
 
             var approverUsers = await _context.Users
                 .Where(u => approverUserIds.Contains(u.Id))
@@ -184,7 +187,10 @@ public class DeferralController : ControllerBase
                         Name = documentName,
                         Url = null,
                         UploadedById = null,
-                        DeferralId = deferral.Id
+                        DeferralId = deferral.Id,
+                        // persist per-document days and next due date when provided
+                        DaysSought = selectedDoc.DaysSought,
+                        NextDocumentDueDate = selectedDoc.NextDocumentDueDate.HasValue ? DateTime.SpecifyKind(selectedDoc.NextDocumentDueDate.Value, DateTimeKind.Utc) : null
                     });
                 }
             }
@@ -288,7 +294,8 @@ public class DeferralController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "❌ Error creating deferral");
-            return StatusCode(500, new { error = ex.Message });
+            var inner = ex.GetBaseException();
+            return StatusCode(500, new { error = ex.Message, innerException = inner?.Message, stack = ex.ToString() });
         }
     }
 
@@ -2492,14 +2499,36 @@ public class DeferralController : ControllerBase
         return Guid.Parse(orderedGuidText);
     }
 
-    private static Guid? TryGetGuidFromClientValue(string? raw)
+    private static Guid? TryGetGuidFromClientValue(object? raw)
     {
-        if (string.IsNullOrWhiteSpace(raw))
+        if (raw == null) return null;
+
+        // If caller already passed a Guid
+        if (raw is Guid g) return g;
+
+        // If it's a string, attempt to parse
+        if (raw is string s)
         {
-            return null;
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            return Guid.TryParse(s, out var parsedGuid) ? parsedGuid : null;
         }
 
-        return Guid.TryParse(raw, out var parsedGuid) ? parsedGuid : null;
+        // If the JSON binder produced a JsonElement (edge cases), try to extract as string
+        if (raw is System.Text.Json.JsonElement je)
+        {
+            try
+            {
+                var str = je.GetString();
+                if (string.IsNullOrWhiteSpace(str)) return null;
+                return Guid.TryParse(str, out var parsed) ? parsed : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        return null;
     }
 
     private static List<Approver> OrderApproversForFlow(IEnumerable<Approver> approvers)
@@ -2737,6 +2766,9 @@ public class SelectedDocumentRequest
     public string? Name { get; set; }
     public string? Type { get; set; }
     public string? Category { get; set; }
+    // Per-document deferral metadata
+    public int? DaysSought { get; set; }
+    public DateTime? NextDocumentDueDate { get; set; }
 }
 
 public class DeferralCommentRequest
