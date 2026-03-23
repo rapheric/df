@@ -61,6 +61,43 @@ public class CustomerController : ControllerBase
         }
     }
 
+    // GET /api/customers/search
+    [HttpGet("search")]
+    public async Task<IActionResult> SearchCustomersQuery([FromQuery] string? customerNumber, [FromQuery] string? loanType)
+    {
+        try
+        {
+            var query = _context.Users.Where(u => u.Role == UserRole.Customer);
+
+            if (!string.IsNullOrEmpty(customerNumber))
+            {
+                query = query.Where(u => u.CustomerNumber != null && 
+                                        u.CustomerNumber.Contains(customerNumber));
+            }
+
+            var customers = await query
+                .Select(u => new
+                {
+                    id = u.Id,
+                    customerNumber = u.CustomerNumber ?? "",
+                    customerName = u.Name,
+                    name = u.Name,
+                    email = u.Email,
+                    active = u.Active,
+                    loanType = loanType  // Include the requested loan type in response
+                })
+                .Take(20)
+                .ToListAsync();
+
+            return Ok(customers);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error searching customers");
+            return StatusCode(500, new { message = "Internal server error" });
+        }
+    }
+
     // GET /api/customers/search-dcl
     [HttpGet("search-dcl")]
     public async Task<IActionResult> SearchByDcl([FromQuery] string dclNo)

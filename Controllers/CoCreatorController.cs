@@ -504,7 +504,12 @@ public class CoCreatorController : ControllerBase
                             comment = d.Comment,
                             checkerComment = d.CheckerComment,
                             deferralNumber = d.DeferralNumber,
-                            deferralNo = d.DeferralNumber
+                            deferralNo = d.DeferralNumber,
+                            createdAt = d.CreatedAt,
+                            updatedAt = d.UpdatedAt,
+                            uploadedAt = d.FileUrl != null ? d.UpdatedAt : (DateTime?)null,
+                            uploadedBy = d.FileUrl != null && c.CreatedBy != null ? new { id = c.CreatedBy.Id, name = c.CreatedBy.Name } : null,
+                            uploadedByRole = d.FileUrl != null && c.CreatedBy != null ? c.CreatedBy.Role.ToString() : null
                         }).ToList()
                     }).ToList(),
                     supportingDocs = c.SupportingDocs.Select(sd => new
@@ -927,6 +932,7 @@ public class CoCreatorController : ControllerBase
         {
             var checklists = await _context.Checklists
                 .Where(c => c.CreatedById == creatorId)
+                .Include(c => c.CreatedBy)
                 .Include(c => c.AssignedToRM)
                 .Include(c => c.AssignedToCoChecker)
                 .Include(c => c.Documents)
@@ -945,6 +951,7 @@ public class CoCreatorController : ControllerBase
                     assignedToRMId = c.AssignedToRMId,
                     createdAt = c.CreatedAt,
                     updatedAt = c.UpdatedAt,
+                    createdBy = c.CreatedBy != null ? new { id = c.CreatedBy.Id, name = c.CreatedBy.Name, role = c.CreatedBy.Role.ToString() } : null,
                     assignedToRM = c.AssignedToRM != null ? new { id = c.AssignedToRM.Id, name = c.AssignedToRM.Name } : null,
                     assignedToCoChecker = c.AssignedToCoChecker != null ? new { id = c.AssignedToCoChecker.Id, name = c.AssignedToCoChecker.Name } : null,
                     documents = c.Documents.Select(dc => new
@@ -962,7 +969,12 @@ public class CoCreatorController : ControllerBase
                             rmStatus = d.RmStatus.ToString().ToLower(),
                             fileUrl = d.FileUrl,
                             comment = d.Comment,
-                            deferralNumber = d.DeferralNumber
+                            deferralNumber = d.DeferralNumber,
+                            createdAt = d.CreatedAt,
+                            updatedAt = d.UpdatedAt,
+                            uploadedAt = d.FileUrl != null ? d.UpdatedAt : (DateTime?)null,
+                            uploadedBy = d.FileUrl != null && c.CreatedBy != null ? new { id = c.CreatedBy.Id, name = c.CreatedBy.Name } : null,
+                            uploadedByRole = d.FileUrl != null && c.CreatedBy != null ? c.CreatedBy.Role.ToString() : null
                         }).ToList()
                     }).ToList()
                 })
@@ -1138,6 +1150,17 @@ public class CoCreatorController : ControllerBase
             if (checklist == null)
             {
                 return NotFound(new { error = "Checklist not found" });
+            }
+
+            var submittedDocumentIds = request.Documents?
+                .Select(doc => doc.Id ?? doc._id)
+                .Where(id => id.HasValue)
+                .Select(id => id!.Value)
+                .ToHashSet() ?? new HashSet<Guid>();
+
+            if (submittedDocumentIds.Count > 0)
+            {
+                RemoveMissingChecklistDocuments(checklist, submittedDocumentIds);
             }
 
             /* ============================================================
@@ -1469,7 +1492,12 @@ public class CoCreatorController : ControllerBase
                             fileUrl = d.FileUrl,
                             comment = d.Comment,
                             deferralNumber = d.DeferralNumber,
-                            deferralNo = d.DeferralNumber
+                            deferralNo = d.DeferralNumber,
+                            createdAt = d.CreatedAt,
+                            updatedAt = d.UpdatedAt,
+                            uploadedAt = d.FileUrl != null ? d.UpdatedAt : (DateTime?)null,
+                            uploadedBy = d.FileUrl != null && updatedChecklist.CreatedBy != null ? new { id = updatedChecklist.CreatedBy.Id, name = updatedChecklist.CreatedBy.Name } : null,
+                            uploadedByRole = d.FileUrl != null && updatedChecklist.CreatedBy != null ? updatedChecklist.CreatedBy.Role.ToString() : null
                         }).ToList()
                     }).ToList(),
                     supportingDocs = updatedChecklist.SupportingDocs.Select(sd => new
@@ -1539,6 +1567,38 @@ public class CoCreatorController : ControllerBase
         };
     }
 
+    private void RemoveMissingChecklistDocuments(Checklist checklist, HashSet<Guid> submittedDocumentIds)
+    {
+        var removedCount = 0;
+
+        foreach (var category in checklist.Documents.ToList())
+        {
+            var documentsToRemove = category.DocList
+                .Where(doc => !submittedDocumentIds.Contains(doc.Id))
+                .ToList();
+
+            foreach (var document in documentsToRemove)
+            {
+                category.DocList.Remove(document);
+                _context.Documents.Remove(document);
+                removedCount++;
+                _logger.LogInformation($"🗑️ Removing document omitted from submission: {document.Name} ({document.Id})");
+            }
+
+            if (!category.DocList.Any())
+            {
+                checklist.Documents.Remove(category);
+                _context.DocumentCategories.Remove(category);
+                _logger.LogInformation($"🗑️ Removing empty document category: {category.Category}");
+            }
+        }
+
+        if (removedCount > 0)
+        {
+            _logger.LogInformation($"✅ Removed {removedCount} document(s) missing from submission payload for checklist {checklist.DclNo}");
+        }
+    }
+
     // POST /api/cocreatorChecklist/:id/submit-to-rm
     [HttpPost("{id}/submit-to-rm")]
 
@@ -1556,6 +1616,18 @@ public class CoCreatorController : ControllerBase
             if (checklist == null)
             {
                 return NotFound(new { message = "Checklist not found" });
+            }
+
+            var submittedDocumentIds = request?.Documents?
+                .SelectMany(category => category.DocList ?? new List<DocumentUpdateInSubmitDto>())
+                .Select(doc => doc.Id ?? doc._id)
+                .Where(id => id.HasValue)
+                .Select(id => id!.Value)
+                .ToHashSet() ?? new HashSet<Guid>();
+
+            if (submittedDocumentIds.Count > 0)
+            {
+                RemoveMissingChecklistDocuments(checklist, submittedDocumentIds);
             }
 
             /* ============================================================

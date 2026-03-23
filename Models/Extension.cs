@@ -68,6 +68,12 @@ public class Extension
     public string? RequestedByName { get; set; }
     public DateTime RequestedDate { get; set; } = DateTime.UtcNow;
 
+    // Persist selected documents for this extension (per-document days and next due dates)
+    public string? SelectedDocumentsJson { get; set; }
+
+    [NotMapped]
+    public List<SelectedDocumentData>? SelectedDocuments { get; set; }
+
     // Rejection/return info
     public string? RejectionReason { get; set; }
     public string? RejectedBy { get; set; }

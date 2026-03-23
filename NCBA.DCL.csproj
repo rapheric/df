@@ -52,7 +52,9 @@
   <ItemGroup>
     <Compile Remove="NCBA.DCL\**" />
     <Compile Remove="tests\**\*.cs" />
+    <Compile Remove="DefQuery\**" />
     <EmbeddedResource Remove="NCBA.DCL\**" />
     <None Remove="NCBA.DCL\**" />
+    <None Remove="DefQuery\**" />
   </ItemGroup>
 </Project>

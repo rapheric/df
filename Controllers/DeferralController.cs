@@ -1,3 +1,4 @@
+
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -193,6 +194,30 @@ public class DeferralController : ControllerBase
                         NextDocumentDueDate = selectedDoc.NextDocumentDueDate.HasValue ? DateTime.SpecifyKind(selectedDoc.NextDocumentDueDate.Value, DateTimeKind.Utc) : null
                     });
                 }
+
+                // After adding all documents, set the main deferral.DaysSought to the max from documents
+                // This ensures the deferral has a valid DaysSought for extension requests later
+                var maxDocumentDays = request.SelectedDocuments
+                    .Where(d => d.DaysSought.HasValue && d.DaysSought > 0)
+                    .Select(d => d.DaysSought ?? 0)
+                    .DefaultIfEmpty(0)
+                    .Max();
+
+                if (maxDocumentDays > 0)
+                {
+                    deferral.DaysSought = maxDocumentDays;
+                    _logger.LogWarning($"[DEFERRAL-CREATE] Set deferral.DaysSought to {maxDocumentDays} (max from {request.SelectedDocuments.Count} documents)");
+                }
+
+                // Also store selected documents as JSON for later retrieval/comparison
+                try
+                {
+                    deferral.SelectedDocumentsJson = JsonSerializer.Serialize(request.SelectedDocuments);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "[DEFERRAL-CREATE] Failed to serialize selected documents to JSON");
+                }
             }
 
             for (var approverIndex = 0; approverIndex < request.Approvers.Count; approverIndex++)
@@ -320,6 +345,7 @@ public class DeferralController : ControllerBase
 
             deferrals.ForEach(ApplyApproverOrdering);
             deferrals.ForEach(HydrateDeferralComments);
+            deferrals.ForEach(DeserializeSelectedDocuments);
 
             _logger.LogInformation($"📊 Fetched {deferrals.Count} pending deferrals");
             return Ok(deferrals);
@@ -343,11 +369,24 @@ public class DeferralController : ControllerBase
                 .Include(d => d.Documents)
                     .ThenInclude(doc => doc.UploadedBy)
                 .Include(d => d.Approvers)
+                .Include(d => d.Extensions)
+                    .ThenInclude(e => e.Approvers)
+                        .ThenInclude(a => a.User)
+                .Include(d => d.Extensions)
+                    .ThenInclude(e => e.CreatorApprovedBy)
+                .Include(d => d.Extensions)
+                    .ThenInclude(e => e.CheckerApprovedBy)
+                .Include(d => d.Extensions)
+                    .ThenInclude(e => e.RequestedBy)
+                .Include(d => d.Extensions)
+                    .ThenInclude(e => e.History)
+                        .ThenInclude(h => h.User)
                 .OrderByDescending(d => d.UpdatedAt)
                 .ToListAsync();
 
             deferrals.ForEach(ApplyApproverOrdering);
             deferrals.ForEach(HydrateDeferralComments);
+            deferrals.ForEach(DeserializeSelectedDocuments);
 
             _logger.LogInformation($"✅ Fetched {deferrals.Count} approved deferrals");
             return Ok(deferrals);
@@ -355,6 +394,47 @@ public class DeferralController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "🔥 Error fetching approved deferrals");
+            return StatusCode(500, new { error = ex.Message });
+        }
+    }
+
+    [HttpGet("all")]
+    public async Task<IActionResult> GetAllDeferrals()
+    {
+        try
+        {
+            var deferrals = await _context.Deferrals
+                .Include(d => d.CreatedBy)
+                .Include(d => d.Facilities)
+                .Include(d => d.Documents)
+                    .ThenInclude(doc => doc.UploadedBy)
+                .Include(d => d.Approvers)
+                .Include(d => d.Extensions)
+                    .ThenInclude(e => e.Approvers)
+                        .ThenInclude(a => a.User)
+                .Include(d => d.Extensions)
+                    .ThenInclude(e => e.CreatorApprovedBy)
+                .Include(d => d.Extensions)
+                    .ThenInclude(e => e.CheckerApprovedBy)
+                .Include(d => d.Extensions)
+                    .ThenInclude(e => e.RequestedBy)
+                .Include(d => d.Extensions)
+                    .ThenInclude(e => e.History)
+                        .ThenInclude(h => h.User)
+                .OrderByDescending(d => d.UpdatedAt)
+                .ToListAsync();
+
+            deferrals.ForEach(ApplyApproverOrdering);
+            deferrals.ForEach(HydrateDeferralComments);
+            deferrals.ForEach(DeserializeSelectedDocuments);
+            deferrals.ForEach(d => DeserializeExtensionSelectedDocuments(d.Extensions));
+
+            _logger.LogInformation("📚 Fetched {Count} deferrals across all statuses", deferrals.Count);
+            return Ok(deferrals);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "🔥 Error fetching all deferrals");
             return StatusCode(500, new { error = ex.Message });
         }
     }
@@ -379,6 +459,7 @@ public class DeferralController : ControllerBase
 
             deferrals.ForEach(ApplyApproverOrdering);
             deferrals.ForEach(HydrateDeferralComments);
+            deferrals.ForEach(DeserializeSelectedDocuments);
 
             return Ok(deferrals);
         }
@@ -394,27 +475,78 @@ public class DeferralController : ControllerBase
     {
         try
         {
-            var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
+            var userIdClaim = User.FindFirst("id")?.Value;
+            _logger.LogInformation(string.Format("[DEFERRAL_API] GetMyDeferrals called - User ID claim: {0}", userIdClaim));
+            
+            if (string.IsNullOrWhiteSpace(userIdClaim) || !Guid.TryParse(userIdClaim, out var userId))
+            {
+                _logger.LogError(string.Format("[DEFERRAL_API] Invalid user ID: {0}", userIdClaim));
+                return Unauthorized(new { error = "Invalid user context" });
+            }
 
+            _logger.LogInformation(string.Format("[DEFERRAL_API] Parsed userId: {0}", userId));
+
+            // First, get basic count
+            var totalDefCount = await _context.Deferrals.CountAsync();
+            var userDefCount = await _context.Deferrals.CountAsync(d => d.CreatedById == userId);
+            _logger.LogInformation(string.Format("[DEFERRAL_API] Total deferrals in DB: {0}, User deferrals: {1}", totalDefCount, userDefCount));
+
+            // Get deferrals with minimal includes first
             var deferrals = await _context.Deferrals
                 .Where(d => d.CreatedById == userId)
                 .Include(d => d.CreatedBy)
                 .Include(d => d.Facilities)
-                .Include(d => d.Documents)
-                    .ThenInclude(doc => doc.UploadedBy)
                 .Include(d => d.Approvers)
                 .OrderByDescending(d => d.CreatedAt)
                 .ToListAsync();
 
-            deferrals.ForEach(ApplyApproverOrdering);
-            deferrals.ForEach(HydrateDeferralComments);
+            _logger.LogInformation(string.Format("[DEFERRAL_API] Retrieved {0} deferrals from database", deferrals.Count));
 
+            try
+            {
+                _logger.LogInformation("[DEFERRAL_API] Applying approver ordering...");
+                deferrals.ForEach(ApplyApproverOrdering);
+                _logger.LogInformation("[DEFERRAL_API] Approver ordering complete");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[DEFERRAL_API] Error in ApplyApproverOrdering");
+                throw;
+            }
+
+            try
+            {
+                _logger.LogInformation("[DEFERRAL_API] Hydrating deferral comments...");
+                deferrals.ForEach(HydrateDeferralComments);
+                _logger.LogInformation("[DEFERRAL_API] Hydrating comments complete");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[DEFERRAL_API] Error in HydrateDeferralComments");
+                throw;
+            }
+
+            try
+            {
+                _logger.LogInformation("[DEFERRAL_API] Deserializing selected documents...");
+                deferrals.ForEach(DeserializeSelectedDocuments);
+                _logger.LogInformation("[DEFERRAL_API] Deserializing documents complete");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[DEFERRAL_API] Error in DeserializeSelectedDocuments");
+                throw;
+            }
+
+            _logger.LogInformation(string.Format("[DEFERRAL_API] About to return {0} deferrals", deferrals.Count));
             return Ok(deferrals);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "🔥 Error fetching my deferrals");
-            return StatusCode(500, new { error = ex.Message });
+            _logger.LogError(ex, "[DEFERRAL_API] Error fetching my deferrals");
+            _logger.LogError(string.Format("[DEFERRAL_API] Exception Type: {0}", ex.GetType().Name));
+            _logger.LogError(string.Format("[DEFERRAL_API] Exception Message: {0}", ex.Message));
+            return StatusCode(500, new { error = ex.Message, type = ex.GetType().Name });
         }
     }
 
@@ -447,6 +579,7 @@ public class DeferralController : ControllerBase
 
             deferrals.ForEach(ApplyApproverOrdering);
             deferrals.ForEach(HydrateDeferralComments);
+            deferrals.ForEach(DeserializeSelectedDocuments);
 
             return Ok(deferrals);
         }
@@ -482,6 +615,7 @@ public class DeferralController : ControllerBase
 
             deferrals.ForEach(ApplyApproverOrdering);
             deferrals.ForEach(HydrateDeferralComments);
+            deferrals.ForEach(DeserializeSelectedDocuments);
 
             return Ok(deferrals);
         }
@@ -504,6 +638,13 @@ public class DeferralController : ControllerBase
                     .ThenInclude(doc => doc.UploadedBy)
                 .Include(d => d.Approvers)
                     .ThenInclude(a => a.User)
+                .Include(d => d.Extensions)
+                    .ThenInclude(e => e.Approvers)
+                        .ThenInclude(a => a.User)
+                .Include(d => d.Extensions)
+                    .ThenInclude(e => e.AdditionalFiles)
+                .Include(d => d.Extensions)
+                    .ThenInclude(e => e.History)
                 .FirstOrDefaultAsync(d => d.Id == id);
 
             if (deferral == null)
@@ -511,6 +652,8 @@ public class DeferralController : ControllerBase
 
             ApplyApproverOrdering(deferral);
             HydrateDeferralComments(deferral);
+            DeserializeSelectedDocuments(deferral);
+            DeserializeExtensionSelectedDocuments(deferral.Extensions);
 
             return Ok(deferral);
         }
@@ -518,6 +661,52 @@ public class DeferralController : ControllerBase
         {
             _logger.LogError(ex, "🔥 Error fetching deferral");
             return StatusCode(500, new { error = ex.Message });
+        }
+    }
+
+    // ============================================
+    // SEARCH
+    // ============================================
+
+    [HttpGet("search")]
+    public async Task<IActionResult> SearchDeferrals([FromQuery] string? dclNumber, [FromQuery] string? deferralNumber)
+    {
+        try
+        {
+            var query = _context.Deferrals.Include(d => d.CreatedBy).AsQueryable();
+
+            if (!string.IsNullOrEmpty(dclNumber))
+            {
+                query = query.Where(d => d.DclNumber != null && d.DclNumber.Contains(dclNumber));
+            }
+
+            if (!string.IsNullOrEmpty(deferralNumber))
+            {
+                query = query.Where(d => d.DeferralNumber != null && d.DeferralNumber.Contains(deferralNumber));
+            }
+
+            var results = await query
+                .Select(d => new
+                {
+                    id = d.Id,
+                    deferralNumber = d.DeferralNumber,
+                    dclNumber = d.DclNumber,
+                    dclNo = d.DclNumber,  // Support both naming conventions
+                    customerName = d.CreatedBy != null ? d.CreatedBy.Name : "Unknown",
+                    customerNumber = d.CreatedBy != null ? d.CreatedBy.CustomerNumber : null,
+                    loanType = d.LoanType,
+                    status = d.Status.ToString(),
+                    createdAt = d.CreatedAt
+                })
+                .Take(20)  // Limit results for performance
+                .ToListAsync();
+
+            return Ok(results);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error searching deferrals");
+            return StatusCode(500, new { message = "Internal server error" });
         }
     }
 
@@ -617,10 +806,14 @@ public class DeferralController : ControllerBase
         {
             var deferral = await _context.Deferrals
                 .Include(d => d.Approvers)
+                .Include(d => d.Documents)  // CRITICAL: Must load documents to delete them
+                .Include(d => d.Facilities)  // Also include other relationships that might be updated
                 .FirstOrDefaultAsync(d => d.Id == id);
 
             if (deferral == null)
                 return NotFound(new { error = "Deferral not found" });
+
+            _logger.LogWarning($"[DEFERRAL-DELETE-FETCH] Loaded deferral {id} with {deferral.Documents?.Count ?? 0} documents");
 
             // Update allowed fields
             if (!string.IsNullOrEmpty(request.DeferralDescription))
@@ -646,44 +839,119 @@ public class DeferralController : ControllerBase
             // Handle selected documents update (for removing documents during resubmission)
             if (request.SelectedDocuments != null)
             {
-                // Keep track of which documents to keep by name
-                var documentsToKeep = request.SelectedDocuments
+                _logger.LogWarning($"[DEFERRAL-DELETE-RECV] Received {request.SelectedDocuments.Count} selectedDocuments from frontend");
+                foreach (var doc in request.SelectedDocuments)
+                {
+                    _logger.LogWarning($"[DEFERRAL-DELETE-RECV]   - Name: '{doc.Name}', Type: '{doc.Type}'");
+                }
+
+                // selectedDocuments from frontend contains the documents the user wants to KEEP
+                // Documents that are NOT in this list should be removed from DeferralDocuments table
+                var selectedDocumentNames = request.SelectedDocuments
                     .Where(d => !string.IsNullOrWhiteSpace(d.Name))
-                    .Select(d => d.Name!)
-                    .ToList();
+                    .Select(d => d.Name!.Trim().ToLowerInvariant())
+                    .ToHashSet();
 
-                // Remove documents that are no longer in the selectedDocuments list
+                _logger.LogWarning($"[DEFERRAL-DELETE-NORM] Normalized names to KEEP ({selectedDocumentNames.Count}): {string.Join(" | ", selectedDocumentNames)}");
+                _logger.LogWarning($"[DEFERRAL-DELETE-DB] Current DB has {deferral.Documents.Count} documents:");
+                foreach (var dbDoc in deferral.Documents)
+                {
+                    var normName = (dbDoc.Name ?? "").Trim().ToLowerInvariant();
+                    var shouldKeep = selectedDocumentNames.Contains(normName);
+                    _logger.LogWarning($"[DEFERRAL-DELETE-DB]   - '{dbDoc.Name}' (normalized: '{normName}') -> {(shouldKeep ? "KEEP" : "REMOVE")}");
+                }
+
+                // Remove DeferralDocuments that are no longer in selectedDocuments (user deleted them)
+                // Do NOT remove already-uploaded documents (those with a non-empty Url) unless
+                // the client explicitly indicates deletion. This preserves files in the
+                // Mandatory DCL / Additional sections after resubmission.
                 var documentsToRemove = deferral.Documents
-                    .Where(d => !documentsToKeep.Contains(d.Name))
+                    .Where(d => string.IsNullOrWhiteSpace(d.Url) && !selectedDocumentNames.Contains((d.Name ?? "").Trim().ToLowerInvariant()))
                     .ToList();
 
-                _context.DeferralDocuments.RemoveRange(documentsToRemove);
+                _logger.LogWarning($"[DEFERRAL-DELETE-ACTION] Will remove {documentsToRemove.Count} of {deferral.Documents.Count} documents");
+                foreach (var docToRemove in documentsToRemove)
+                {
+                    _logger.LogWarning($"[DEFERRAL-DELETE-ACTION]   Removing: '{docToRemove.Name}'");
+                }
+
+                if (documentsToRemove.Count > 0)
+                {
+                    _logger.LogWarning($"[DEFERRAL-DELETE-ACTION] Actually calling RemoveRange for {documentsToRemove.Count} documents");
+                    _context.DeferralDocuments.RemoveRange(documentsToRemove);
+                }
+                else
+                {
+                    _logger.LogWarning($"[DEFERRAL-DELETE-ACTION] No documents matched for removal");
+                }
 
                 // Update per-document metadata (DaysSought, NextDocumentDueDate)
                 foreach (var selectedDoc in request.SelectedDocuments)
                 {
                     if (string.IsNullOrWhiteSpace(selectedDoc.Name)) continue;
 
-                    var existingDoc = deferral.Documents.FirstOrDefault(d => d.Name == selectedDoc.Name);
+                    var selectedDocNameLower = selectedDoc.Name.Trim().ToLowerInvariant();
+                    var existingDoc = deferral.Documents.FirstOrDefault(d =>
+                        (d.Name ?? "").Trim().ToLowerInvariant() == selectedDocNameLower);
                     if (existingDoc != null)
                     {
                         existingDoc.DaysSought = selectedDoc.DaysSought;
                         existingDoc.NextDocumentDueDate = selectedDoc.NextDocumentDueDate;
+                        _logger.LogWarning($"[DEFERRAL-DELETE-META] Updated metadata for '{existingDoc.Name}'");
                     }
+                }
+
+                // Persist selected documents as JSON for later retrieval
+                try
+                {
+                    deferral.SelectedDocumentsJson = JsonSerializer.Serialize(request.SelectedDocuments);
+                    _logger.LogWarning($"[DEFERRAL-DELETE-JSON] Serialized {request.SelectedDocuments.Count} selected documents to JSON");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "[DEFERRAL-DELETE-JSON] Failed to serialize selected documents");
+                }
+
+                // Update main deferral DaysSought field to match the maximum DaysSought from selected documents
+                // This ensures the deferral.DaysSought field is valid for extension submissions
+                var maxDaysSought = request.SelectedDocuments
+                    .Where(d => d.DaysSought.HasValue && d.DaysSought > 0)
+                    .Select(d => d.DaysSought ?? 0)
+                    .DefaultIfEmpty(0)
+                    .Max();
+
+                if (maxDaysSought > 0)
+                {
+                    deferral.DaysSought = maxDaysSought;
+                    _logger.LogWarning($"[DEFERRAL-DAYSSOUGHT] Updated deferral.DaysSought to {maxDaysSought} (max from {request.SelectedDocuments.Count} selected documents)");
+                }
+                else
+                {
+                    _logger.LogWarning($"[DEFERRAL-DAYSSOUGHT] No valid DaysSought found in selected documents, keeping current value: {deferral.DaysSought}");
                 }
             }
 
+
             var requestedApprovers = request.ApproverFlow ?? request.Approvers;
             Guid? previousFirstApproverUserId = null;
+            Guid? previousCurrentApproverUserId = null;
             Guid? updatedFirstApproverUserId = null;
             Guid? currentPendingApproverUserId = null;
             string? currentPendingApproverRole = null;
             var approverFlowUpdated = false;
+            var previousApproverSnapshot = new List<ApproverFlowParticipant>();
+            var updatedApproverSnapshot = new List<ApproverFlowParticipant>();
             if (requestedApprovers != null && requestedApprovers.Count > 0)
             {
                 approverFlowUpdated = true;
                 var orderedExistingApprovers = OrderApproversForFlow(deferral.Approvers);
                 previousFirstApproverUserId = orderedExistingApprovers.FirstOrDefault()?.UserId;
+                previousCurrentApproverUserId = orderedExistingApprovers
+                    .ElementAtOrDefault(GetSafeCurrentApproverIndex(deferral.CurrentApproverIndex, orderedExistingApprovers.Count))
+                    ?.UserId;
+                previousApproverSnapshot = orderedExistingApprovers
+                    .Select(a => new ApproverFlowParticipant(a.UserId, a.Name, a.Role, a.Approved))
+                    .ToList();
                 var approvedExistingApprovers = orderedExistingApprovers
                     .Select((approver, index) => new { approver, index })
                     .Where(x => x.approver.Approved)
@@ -750,6 +1018,15 @@ public class DeferralController : ControllerBase
                         ?? TryGetGuidFromClientValue(pendingApproverRequest.User);
                     currentPendingApproverRole = pendingApproverRequest.Role;
                 }
+
+                updatedApproverSnapshot = requestedApprovers
+                    .Select(a => new ApproverFlowParticipant(
+                        TryGetGuidFromClientValue(a.UserId) ?? TryGetGuidFromClientValue(a.User),
+                        a.Name,
+                        a.Role,
+                        false
+                    ))
+                    .ToList();
 
                 var storeForStatus = ParseDeferralCommentStore(deferral.ReworkComments);
                 if (
@@ -821,8 +1098,34 @@ public class DeferralController : ControllerBase
                 // were already set above when rebuilding the approver list, so preserve them
             }
 
+            if (approverFlowUpdated)
+            {
+                await AppendApproverFlowChangeAuditAndNotificationsAsync(
+                    deferral,
+                    previousApproverSnapshot,
+                    updatedApproverSnapshot,
+                    previousCurrentApproverUserId,
+                    currentPendingApproverUserId,
+                    currentPendingApproverRole
+                );
+            }
+
             deferral.UpdatedAt = DateTime.UtcNow;
+
+            // Log state before SaveChanges
+            _logger.LogWarning($"[DEFERRAL-DELETE-SAVE] Before SaveChanges: Deferral has {deferral.Documents.Count} documents");
+            foreach (var doc in deferral.Documents)
+            {
+                _logger.LogWarning($"[DEFERRAL-DELETE-SAVE]   - '{doc.Name}' (EntityState: {_context.Entry(doc).State})");
+            }
+
             await _context.SaveChangesAsync();
+
+            _logger.LogWarning($"[DEFERRAL-DELETE-SAVE] After SaveChanges: Deferral has {deferral.Documents.Count} documents");
+            foreach (var doc in deferral.Documents)
+            {
+                _logger.LogWarning($"[DEFERRAL-DELETE-SAVE]   - '{doc.Name}' (EntityState: {_context.Entry(doc).State})");
+            }
 
             if (
                 previousFirstApproverUserId.HasValue
@@ -932,6 +1235,7 @@ public class DeferralController : ControllerBase
             {
                 ApplyApproverOrdering(refreshedDeferral);
                 HydrateDeferralComments(refreshedDeferral);
+                DeserializeSelectedDocuments(refreshedDeferral);
                 return Ok(new { success = true, deferral = refreshedDeferral });
             }
 
@@ -1058,30 +1362,108 @@ public class DeferralController : ControllerBase
         {
             var deferral = await _context.Deferrals
                 .Include(d => d.Approvers)
+                    .ThenInclude(a => a.User)
                 .FirstOrDefaultAsync(d => d.Id == id);
 
             if (deferral == null)
                 return NotFound(new { error = "Deferral not found" });
 
+            var orderedExistingApprovers = OrderApproversForFlow(deferral.Approvers);
+            var previousApproverSnapshot = orderedExistingApprovers
+                .Select(a => new ApproverFlowParticipant(a.UserId, a.Name, a.Role, a.Approved))
+                .ToList();
+            var previousCurrentApproverUserId = orderedExistingApprovers
+                .ElementAtOrDefault(GetSafeCurrentApproverIndex(deferral.CurrentApproverIndex, orderedExistingApprovers.Count))
+                ?.UserId;
+            var approvedExistingApprovers = orderedExistingApprovers
+                .Select((approver, index) => new { approver, index })
+                .Where(x => x.approver.Approved)
+                .ToList();
+
+            foreach (var approved in approvedExistingApprovers)
+            {
+                if (approved.index >= approvers.Count)
+                {
+                    return BadRequest(new { error = "Approved approvers cannot be removed or reordered" });
+                }
+
+                var requestedApprovedUserId = approvers[approved.index].UserId ?? approvers[approved.index].User;
+                if (requestedApprovedUserId != approved.approver.UserId)
+                {
+                    return BadRequest(new { error = "Any approver who has already approved cannot be changed" });
+                }
+            }
+
             _context.Approvers.RemoveRange(deferral.Approvers);
+
+            var firstPendingApproverIndex = -1;
+            Guid? currentPendingApproverUserId = null;
+            string? currentPendingApproverRole = null;
 
             for (var approverIndex = 0; approverIndex < approvers.Count; approverIndex++)
             {
                 var approverReq = approvers[approverIndex];
+                var approverUserId = approverReq.UserId ?? approverReq.User;
+                var existingApprovedAtIndex = approvedExistingApprovers.FirstOrDefault(x => x.index == approverIndex);
+                var shouldRemainApproved = existingApprovedAtIndex != null
+                    && existingApprovedAtIndex.approver.UserId == approverUserId;
+
+                if (!shouldRemainApproved && firstPendingApproverIndex < 0)
+                {
+                    firstPendingApproverIndex = approverIndex;
+                    currentPendingApproverUserId = approverUserId;
+                    currentPendingApproverRole = approverReq.Role;
+                }
+
                 var approver = new Approver
                 {
                     Id = CreateOrderedApproverId(id, approverIndex),
-                    UserId = approverReq.UserId ?? approverReq.User,
+                    UserId = approverUserId,
                     Name = approverReq.Name,
                     Role = approverReq.Role,
-                    Approved = false,
+                    Approved = shouldRemainApproved,
+                    ApprovedAt = shouldRemainApproved ? existingApprovedAtIndex!.approver.ApprovedAt : null,
                     DeferralId = id
                 };
                 _context.Approvers.Add(approver);
             }
 
-            deferral.CurrentApproverIndex = 0;
+            deferral.CurrentApproverIndex = firstPendingApproverIndex >= 0
+                ? firstPendingApproverIndex
+                : Math.Max(approvers.Count - 1, 0);
+            deferral.UpdatedAt = DateTime.UtcNow;
+
+            var updatedApproverSnapshot = approvers
+                .Select(a => new ApproverFlowParticipant(a.UserId ?? a.User, a.Name, a.Role, false))
+                .ToList();
+
+            await AppendApproverFlowChangeAuditAndNotificationsAsync(
+                deferral,
+                previousApproverSnapshot,
+                updatedApproverSnapshot,
+                previousCurrentApproverUserId,
+                currentPendingApproverUserId,
+                currentPendingApproverRole
+            );
+
             await _context.SaveChangesAsync();
+
+            var refreshedDeferral = await _context.Deferrals
+                .Include(d => d.CreatedBy)
+                .Include(d => d.Facilities)
+                .Include(d => d.Documents)
+                    .ThenInclude(doc => doc.UploadedBy)
+                .Include(d => d.Approvers)
+                    .ThenInclude(a => a.User)
+                .FirstOrDefaultAsync(d => d.Id == id);
+
+            if (refreshedDeferral != null)
+            {
+                ApplyApproverOrdering(refreshedDeferral);
+                HydrateDeferralComments(refreshedDeferral);
+                DeserializeSelectedDocuments(refreshedDeferral);
+                return Ok(new { message = "Approvers set", deferral = refreshedDeferral });
+            }
 
             return Ok(new { message = "Approvers set" });
         }
@@ -2084,8 +2466,11 @@ public class DeferralController : ControllerBase
             if (deferral == null)
                 return NotFound(new { error = "Deferral not found" });
 
-            if (deferral.Status != DeferralStatus.Approved)
-                return BadRequest(new { error = "Close request can only be submitted for approved deferrals" });
+            var isNewCloseRequest = deferral.Status == DeferralStatus.Approved;
+            var isExistingPendingCloseRequest = deferral.Status == DeferralStatus.CloseRequested;
+
+            if (!isNewCloseRequest && !isExistingPendingCloseRequest)
+                return BadRequest(new { error = "Close request can only be submitted for approved deferrals or updated while pending creator approval" });
 
             deferral.Status = DeferralStatus.CloseRequested;
             deferral.ClosedReason = request.Reason?.Trim();
@@ -2130,6 +2515,43 @@ public class DeferralController : ControllerBase
                 }
             }
 
+            if (request?.CloseRequestDocuments != null)
+            {
+                store.CloseRequestDocuments = NormalizeCloseRequestDocuments(
+                    request.CloseRequestDocuments.Select(item => new CloseRequestDocumentState
+                    {
+                        DocumentName = item?.DocumentName,
+                        Comment = item?.Comment,
+                        CreatorStatus = "pending",
+                        CheckerStatus = "pending",
+                        Files = (item?.Files ?? new List<CloseRequestUploadedFileRequest>())
+                            .Select(file => new CloseRequestUploadedFile
+                            {
+                                DocumentId = file?.DocumentId,
+                                FileName = file?.FileName,
+                                Url = file?.Url,
+                                UploadedAt = file?.UploadedAt ?? DateTime.UtcNow,
+                            })
+                            .ToList(),
+                    }));
+
+                foreach (var item in store.CloseRequestDocuments.Where(i => !string.IsNullOrWhiteSpace(i?.Comment)))
+                {
+                    store.Comments.Add(new DeferralCommentEntry
+                    {
+                        Text = $"[Close Request] {item.DocumentName}: {item.Comment!.Trim()}",
+                        CreatedAt = DateTime.UtcNow,
+                        AuthorName = actorName,
+                        AuthorRole = userRole,
+                        Author = new DeferralCommentAuthor
+                        {
+                            Name = actorName,
+                            Role = userRole,
+                        }
+                    });
+                }
+            }
+
             deferral.ReworkComments = SerializeDeferralCommentStore(store);
 
             await _context.SaveChangesAsync();
@@ -2157,12 +2579,19 @@ public class DeferralController : ControllerBase
                 _logger.LogWarning(rmCloseEx, "⚠️ Failed to notify RM after close request submission for {DeferralNumber}", deferral.DeferralNumber);
             }
 
-            _logger.LogInformation("📨 Close request submitted for deferral {DeferralNumber} by RM {UserId}", deferral.DeferralNumber, userId);
+            _logger.LogInformation(
+                isExistingPendingCloseRequest
+                    ? "📨 Close request updated for deferral {DeferralNumber} by RM {UserId}"
+                    : "📨 Close request submitted for deferral {DeferralNumber} by RM {UserId}",
+                deferral.DeferralNumber,
+                userId);
 
             return Ok(new
             {
                 success = true,
-                message = "Close request submitted successfully",
+                message = isExistingPendingCloseRequest
+                    ? "Close request updated successfully"
+                    : "Close request submitted successfully",
                 deferral,
                 status = deferral.Status.ToString()
             });
@@ -2201,10 +2630,42 @@ public class DeferralController : ControllerBase
             deferral.Status = DeferralStatus.CloseRequestedCreatorApproved;
             deferral.UpdatedAt = DateTime.UtcNow;
 
+            var actorName = User.FindFirst(ClaimTypes.Name)?.Value ?? "Creator";
+            var store = ParseDeferralCommentStore(deferral.ReworkComments);
+
+            if (store.CloseRequestDocuments.Count > 0)
+            {
+                var decisionLookup = (request?.CreatorDocumentDecisions ?? new List<CloseRequestDocumentDecisionRequest>())
+                    .Where(item => !string.IsNullOrWhiteSpace(item?.DocumentName))
+                    .ToDictionary(
+                        item => NormalizeCloseRequestDocumentKey(item!.DocumentName),
+                        item => item!,
+                        StringComparer.OrdinalIgnoreCase);
+
+                foreach (var closeRequestDocument in store.CloseRequestDocuments)
+                {
+                    var key = NormalizeCloseRequestDocumentKey(closeRequestDocument.DocumentName);
+                    if (!decisionLookup.TryGetValue(key, out var decision))
+                    {
+                        return BadRequest(new { error = $"Please review the uploaded close document for {closeRequestDocument.DocumentName}" });
+                    }
+
+                    closeRequestDocument.CreatorStatus = string.Equals(decision.Status, "approved", StringComparison.OrdinalIgnoreCase)
+                        ? "approved"
+                        : "pending";
+                    closeRequestDocument.CreatorComment = decision.Comment?.Trim();
+                    closeRequestDocument.CreatorReviewedByName = actorName;
+                    closeRequestDocument.CreatorReviewedAt = DateTime.UtcNow;
+                }
+
+                if (store.CloseRequestDocuments.Any(document => !string.Equals(document.CreatorStatus, "approved", StringComparison.OrdinalIgnoreCase)))
+                {
+                    return BadRequest(new { error = "All close request documents must be approved before forwarding to checker" });
+                }
+            }
+
             if (!string.IsNullOrWhiteSpace(request?.Comment))
             {
-                var actorName = User.FindFirst(ClaimTypes.Name)?.Value ?? "Creator";
-                var store = ParseDeferralCommentStore(deferral.ReworkComments);
                 store.Comments.Add(new DeferralCommentEntry
                 {
                     Text = request.Comment.Trim(),
@@ -2217,8 +2678,9 @@ public class DeferralController : ControllerBase
                         Role = userRole,
                     }
                 });
-                deferral.ReworkComments = SerializeDeferralCommentStore(store);
             }
+
+            deferral.ReworkComments = SerializeDeferralCommentStore(store);
 
             await _context.SaveChangesAsync();
             HydrateDeferralComments(deferral);
@@ -2286,10 +2748,22 @@ public class DeferralController : ControllerBase
             deferral.Status = DeferralStatus.Closed;
             deferral.UpdatedAt = DateTime.UtcNow;
 
+            var actorName = User.FindFirst(ClaimTypes.Name)?.Value ?? "Checker";
+            var store = ParseDeferralCommentStore(deferral.ReworkComments);
+
+            if (store.CloseRequestDocuments.Count > 0)
+            {
+                foreach (var closeRequestDocument in store.CloseRequestDocuments)
+                {
+                    closeRequestDocument.CheckerStatus = "approved";
+                    closeRequestDocument.CheckerComment = request?.Comment?.Trim();
+                    closeRequestDocument.CheckerReviewedByName = actorName;
+                    closeRequestDocument.CheckerReviewedAt = DateTime.UtcNow;
+                }
+            }
+
             if (!string.IsNullOrWhiteSpace(request?.Comment))
             {
-                var actorName = User.FindFirst(ClaimTypes.Name)?.Value ?? "Checker";
-                var store = ParseDeferralCommentStore(deferral.ReworkComments);
                 store.Comments.Add(new DeferralCommentEntry
                 {
                     Text = request.Comment.Trim(),
@@ -2302,8 +2776,9 @@ public class DeferralController : ControllerBase
                         Role = userRole,
                     }
                 });
-                deferral.ReworkComments = SerializeDeferralCommentStore(store);
             }
+
+            deferral.ReworkComments = SerializeDeferralCommentStore(store);
 
             await _context.SaveChangesAsync();
             HydrateDeferralComments(deferral);
@@ -2715,8 +3190,217 @@ public class DeferralController : ControllerBase
     private static List<Approver> OrderApproversForFlow(IEnumerable<Approver> approvers)
     {
         return approvers
-            .OrderBy(a => a.Id)
+            .Select((approver, originalIndex) => new
+            {
+                Approver = approver,
+                OriginalIndex = originalIndex,
+                Sequence = GetApproverSequenceValue(approver)
+            })
+            .OrderBy(x => x.Sequence)
+            .ThenBy(x => x.OriginalIndex)
+            .Select(x => x.Approver)
             .ToList();
+    }
+
+    private static int GetApproverSequenceValue(Approver? approver)
+    {
+        if (approver == null)
+        {
+            return int.MaxValue;
+        }
+
+        var rawId = approver.Id.ToString("N");
+        if (rawId.Length >= 8)
+        {
+            var sequenceHex = rawId.Substring(0, 8);
+            if (int.TryParse(sequenceHex, System.Globalization.NumberStyles.HexNumber, null, out var sequence))
+            {
+                return sequence;
+            }
+        }
+
+        return int.MaxValue;
+    }
+
+    private sealed record ApproverFlowParticipant(Guid? UserId, string? Name, string? Role, bool Approved);
+
+    private async Task<(string Name, string Role)> ResolveActorAsync()
+    {
+        var actorName = User.FindFirst("name")?.Value ?? User.FindFirst(ClaimTypes.Name)?.Value;
+        var actorRole = User.FindFirst("role")?.Value ?? User.FindFirst(ClaimTypes.Role)?.Value;
+
+        if (string.IsNullOrWhiteSpace(actorName) || string.IsNullOrWhiteSpace(actorRole))
+        {
+            var actorUserIdText = User.FindFirst("id")?.Value;
+            if (Guid.TryParse(actorUserIdText, out var actorUserId))
+            {
+                var actorUser = await _context.Users.FirstOrDefaultAsync(u => u.Id == actorUserId);
+                actorName ??= actorUser?.Name;
+                actorRole ??= actorUser?.Role.ToString();
+            }
+        }
+
+        return (
+            string.IsNullOrWhiteSpace(actorName) ? "System" : actorName.Trim(),
+            string.IsNullOrWhiteSpace(actorRole) ? "System" : actorRole.Trim()
+        );
+    }
+
+    private async Task AppendApproverFlowChangeAuditAndNotificationsAsync(
+        Deferral deferral,
+        IReadOnlyList<ApproverFlowParticipant> previousApprovers,
+        IReadOnlyList<ApproverFlowParticipant> updatedApprovers,
+        Guid? previousCurrentApproverUserId,
+        Guid? currentPendingApproverUserId,
+        string? currentPendingApproverRole)
+    {
+        if (deferral == null)
+        {
+            return;
+        }
+
+        var (actorName, actorRole) = await ResolveActorAsync();
+        var previousApproverIds = previousApprovers
+            .Where(a => a.UserId.HasValue)
+            .Select(a => a.UserId!.Value)
+            .ToHashSet();
+        var updatedApproverIds = updatedApprovers
+            .Where(a => a.UserId.HasValue)
+            .Select(a => a.UserId!.Value)
+            .ToHashSet();
+
+        var addedApprovers = updatedApprovers
+            .Where(a => a.UserId.HasValue && !previousApproverIds.Contains(a.UserId.Value))
+            .ToList();
+        var removedApprovers = previousApprovers
+            .Where(a => a.UserId.HasValue && !updatedApproverIds.Contains(a.UserId.Value))
+            .ToList();
+
+        var previousIndexByUser = previousApprovers
+            .Select((approver, index) => new { approver, index })
+            .Where(x => x.approver.UserId.HasValue)
+            .ToDictionary(x => x.approver.UserId!.Value, x => x.index);
+        var movedApprovers = updatedApprovers
+            .Select((approver, index) => new { approver, index })
+            .Where(x => x.approver.UserId.HasValue)
+            .Where(x => previousIndexByUser.TryGetValue(x.approver.UserId!.Value, out var previousIndex) && previousIndex != x.index)
+            .Select(x => x.approver)
+            .ToList();
+
+        var previousCurrentApprover = previousApprovers.FirstOrDefault(a => a.UserId == previousCurrentApproverUserId);
+        var currentPendingApprover = updatedApprovers.FirstOrDefault(a => a.UserId == currentPendingApproverUserId);
+
+        var auditParts = new List<string> { $"Approval flow updated by {actorName}." };
+        if (addedApprovers.Count > 0)
+        {
+            auditParts.Add($"Added: {string.Join(", ", addedApprovers.Select(approver => FormatApproverParticipant(approver)))}.");
+        }
+        if (removedApprovers.Count > 0)
+        {
+            auditParts.Add($"Removed: {string.Join(", ", removedApprovers.Select(approver => FormatApproverParticipant(approver)))}.");
+        }
+        if (movedApprovers.Count > 0)
+        {
+            auditParts.Add($"Sequence updated for: {string.Join(", ", movedApprovers.Select(approver => FormatApproverParticipant(approver)).Distinct())}.");
+        }
+        if (previousCurrentApproverUserId != currentPendingApproverUserId && currentPendingApproverUserId.HasValue)
+        {
+            auditParts.Add($"Current approver changed from {FormatApproverParticipant(previousCurrentApprover)} to {FormatApproverParticipant(currentPendingApprover, currentPendingApproverRole)}.");
+        }
+
+        var store = ParseDeferralCommentStore(deferral.ReworkComments);
+        store.Comments.Add(new DeferralCommentEntry
+        {
+            Text = string.Join(" ", auditParts.Where(part => !string.IsNullOrWhiteSpace(part))),
+            CreatedAt = DateTime.UtcNow,
+            AuthorName = actorName,
+            AuthorRole = actorRole,
+            Author = new DeferralCommentAuthor
+            {
+                Name = actorName,
+                Role = actorRole,
+            }
+        });
+        deferral.ReworkComments = SerializeDeferralCommentStore(store);
+
+        var notifications = new List<Notification>();
+        var notifiedUsers = new HashSet<Guid>();
+
+        void AddNotification(Guid? userId, string message)
+        {
+            if (!userId.HasValue || !notifiedUsers.Add(userId.Value) || string.IsNullOrWhiteSpace(message))
+            {
+                return;
+            }
+
+            notifications.Add(new Notification
+            {
+                Id = Guid.NewGuid(),
+                UserId = userId.Value,
+                Message = message,
+                Read = false,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow,
+            });
+        }
+
+        if (previousCurrentApproverUserId != currentPendingApproverUserId)
+        {
+            AddNotification(
+                previousCurrentApproverUserId,
+                $"Deferral {deferral.DeferralNumber} is no longer awaiting your approval because the approval flow changed."
+            );
+            AddNotification(
+                currentPendingApproverUserId,
+                $"Deferral {deferral.DeferralNumber} is now awaiting your approval as the current approver."
+            );
+        }
+
+        foreach (var removedApprover in removedApprovers)
+        {
+            AddNotification(
+                removedApprover.UserId,
+                $"You were removed from the approval flow for deferral {deferral.DeferralNumber}."
+            );
+        }
+
+        foreach (var addedApprover in addedApprovers)
+        {
+            AddNotification(
+                addedApprover.UserId,
+                $"You were added to the approval flow for deferral {deferral.DeferralNumber} as {NormalizeRoleLabel(addedApprover.Role)}."
+            );
+        }
+
+        foreach (var movedApprover in movedApprovers)
+        {
+            AddNotification(
+                movedApprover.UserId,
+                $"Your approval step for deferral {deferral.DeferralNumber} was updated."
+            );
+        }
+
+        if (notifications.Count > 0)
+        {
+            _context.Notifications.AddRange(notifications);
+        }
+    }
+
+    private static string NormalizeRoleLabel(string? role)
+    {
+        return string.IsNullOrWhiteSpace(role) ? "Approver" : role.Trim();
+    }
+
+    private static string FormatApproverParticipant(ApproverFlowParticipant? approver, string? fallbackRole = null)
+    {
+        if (approver == null)
+        {
+            return "Approver";
+        }
+
+        var name = string.IsNullOrWhiteSpace(approver.Name) ? "Approver" : approver.Name.Trim();
+        var role = NormalizeRoleLabel(approver.Role ?? fallbackRole);
+        return $"{name} ({role})";
     }
 
     private static void ApplyApproverOrdering(Deferral deferral)
@@ -2789,6 +3473,54 @@ public class DeferralController : ControllerBase
         return JsonSerializer.Serialize(store);
     }
 
+    private static string NormalizeCloseRequestDocumentKey(string? value)
+    {
+        return string.Join(" ", (value ?? string.Empty)
+            .Trim()
+            .ToLowerInvariant()
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    private static List<CloseRequestDocumentState> NormalizeCloseRequestDocuments(IEnumerable<CloseRequestDocumentState>? documents)
+    {
+        return (documents ?? Enumerable.Empty<CloseRequestDocumentState>())
+            .Where(document => !string.IsNullOrWhiteSpace(document?.DocumentName))
+            .GroupBy(document => NormalizeCloseRequestDocumentKey(document!.DocumentName))
+            .Select(group =>
+            {
+                var latest = group.Last();
+                return new CloseRequestDocumentState
+                {
+                    DocumentName = latest.DocumentName?.Trim(),
+                    Comment = latest.Comment?.Trim(),
+                    CreatorStatus = string.IsNullOrWhiteSpace(latest.CreatorStatus)
+                        ? "pending"
+                        : latest.CreatorStatus.Trim().ToLowerInvariant(),
+                    CreatorComment = latest.CreatorComment?.Trim(),
+                    CreatorReviewedByName = latest.CreatorReviewedByName,
+                    CreatorReviewedAt = latest.CreatorReviewedAt,
+                    CheckerStatus = string.IsNullOrWhiteSpace(latest.CheckerStatus)
+                        ? "pending"
+                        : latest.CheckerStatus.Trim().ToLowerInvariant(),
+                    CheckerComment = latest.CheckerComment?.Trim(),
+                    CheckerReviewedByName = latest.CheckerReviewedByName,
+                    CheckerReviewedAt = latest.CheckerReviewedAt,
+                    Files = (latest.Files ?? new List<CloseRequestUploadedFile>())
+                        .Where(file => !string.IsNullOrWhiteSpace(file?.Url) || !string.IsNullOrWhiteSpace(file?.FileName))
+                        .Select(file => new CloseRequestUploadedFile
+                        {
+                            DocumentId = file?.DocumentId,
+                            FileName = file?.FileName,
+                            Url = file?.Url,
+                            UploadedAt = file?.UploadedAt,
+                        })
+                        .ToList(),
+                };
+            })
+            .OrderBy(document => document.DocumentName)
+            .ToList();
+    }
+
     private static void HydrateDeferralComments(Deferral deferral)
     {
         if (deferral == null) return;
@@ -2796,6 +3528,7 @@ public class DeferralController : ControllerBase
         var store = ParseDeferralCommentStore(deferral.ReworkComments);
         deferral.RmReason = store.RmReason;
         deferral.LastReturnedByRole = store.LastReturnedByRole;
+        deferral.CloseRequestDocuments = NormalizeCloseRequestDocuments(store.CloseRequestDocuments);
         var hydratedComments = (store.Comments ?? new List<DeferralCommentEntry>())
             .Where(c => !string.IsNullOrWhiteSpace(c.Text))
             .OrderBy(c => c.CreatedAt ?? DateTime.MinValue)
@@ -2876,6 +3609,67 @@ public class DeferralController : ControllerBase
             case DeferralStatus.ReturnedForRework:
                 deferral.DeferralApprovalStatus = "returned";
                 break;
+        }
+    }
+
+    private static void DeserializeSelectedDocuments(Deferral deferral)
+    {
+        if (deferral == null || string.IsNullOrWhiteSpace(deferral.SelectedDocumentsJson))
+        {
+            deferral!.SelectedDocuments = new List<SelectedDocumentData>();
+            return;
+        }
+
+        try
+        {
+            var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            deferral.SelectedDocuments = JsonSerializer.Deserialize<List<SelectedDocumentData>>(
+                deferral.SelectedDocumentsJson,
+                options
+            ) ?? new List<SelectedDocumentData>();
+        }
+        catch (Exception ex)
+        {
+            // If deserialization fails, return empty list
+            deferral.SelectedDocuments = new List<SelectedDocumentData>();
+        }
+    }
+
+    private static void DeserializeExtensionSelectedDocuments(IEnumerable<Extension>? extensions)
+    {
+        if (extensions == null)
+        {
+            return;
+        }
+
+        foreach (var extension in extensions)
+        {
+            DeserializeExtensionSelectedDocuments(extension);
+        }
+    }
+
+    private static void DeserializeExtensionSelectedDocuments(Extension? extension)
+    {
+        if (extension == null || string.IsNullOrWhiteSpace(extension.SelectedDocumentsJson))
+        {
+            if (extension != null)
+            {
+                extension.SelectedDocuments = new List<SelectedDocumentData>();
+            }
+            return;
+        }
+
+        try
+        {
+            var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            extension.SelectedDocuments = JsonSerializer.Deserialize<List<SelectedDocumentData>>(
+                extension.SelectedDocumentsJson,
+                options
+            ) ?? new List<SelectedDocumentData>();
+        }
+        catch
+        {
+            extension.SelectedDocuments = new List<SelectedDocumentData>();
         }
     }
 }
@@ -2974,11 +3768,15 @@ public class DeferralCommentStore
     public string? ReworkComment { get; set; }
     public string? LastReturnedByRole { get; set; }
     public List<DeferralCommentEntry> Comments { get; set; } = new();
+    public List<CloseRequestDocumentState> CloseRequestDocuments { get; set; } = new();
 }
 
 public class ApprovalRequest
 {
     public string? Comment { get; set; }
+    public List<string>? ApprovedDocuments { get; set; }
+    public List<CloseRequestDocumentDecisionRequest>? CreatorDocumentDecisions { get; set; }
+    public List<CloseRequestDocumentDecisionRequest>? CheckerDocumentDecisions { get; set; }
 }
 
 public class RejectDeferralRequest
@@ -2996,11 +3794,34 @@ public class CloseDeferralRequest
     public string? Reason { get; set; }
     public string? Comment { get; set; }
     public List<CloseDocumentCommentRequest>? DocumentComments { get; set; }
+    public List<CloseRequestDocumentSubmitRequest>? CloseRequestDocuments { get; set; }
 }
 
 public class CloseDocumentCommentRequest
 {
     public string? DocumentName { get; set; }
+    public string? Comment { get; set; }
+}
+
+public class CloseRequestDocumentSubmitRequest
+{
+    public string? DocumentName { get; set; }
+    public string? Comment { get; set; }
+    public List<CloseRequestUploadedFileRequest>? Files { get; set; }
+}
+
+public class CloseRequestUploadedFileRequest
+{
+    public string? DocumentId { get; set; }
+    public string? FileName { get; set; }
+    public string? Url { get; set; }
+    public DateTime? UploadedAt { get; set; }
+}
+
+public class CloseRequestDocumentDecisionRequest
+{
+    public string? DocumentName { get; set; }
+    public string? Status { get; set; }
     public string? Comment { get; set; }
 }
 

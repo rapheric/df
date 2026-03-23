@@ -1,17 +1,17 @@
-﻿﻿using Microsoft.EntityFrameworkCore.Migrations;
+﻿using Microsoft.EntityFrameworkCore.Migrations;
 
 #nullable disable
 
 namespace NCBA.DCL.Migrations
 {
     /// <inheritdoc />
-    public partial class AddExtensionStatusToDeferral : Migration
+    public partial class AddSelectedDocumentsJson : Migration
     {
         /// <inheritdoc />
         protected override void Up(MigrationBuilder migrationBuilder)
         {
             migrationBuilder.AddColumn<string>(
-                name: "ExtensionStatus",
+                name: "SelectedDocumentsJson",
                 table: "Deferrals",
                 type: "longtext",
                 nullable: true)
@@ -22,7 +22,7 @@ namespace NCBA.DCL.Migrations
         protected override void Down(MigrationBuilder migrationBuilder)
         {
             migrationBuilder.DropColumn(
-                name: "ExtensionStatus",
+                name: "SelectedDocumentsJson",
                 table: "Deferrals");
         }
     }

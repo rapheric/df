@@ -10,6 +10,8 @@ public class CreateExtensionRequest
     public int RequestedDaysSought { get; set; }
     public string ExtensionReason { get; set; } = string.Empty;
     public List<ExtensionFileDto>? AdditionalFiles { get; set; }
+    // Map of document name -> requested additional days for that document
+    public Dictionary<string, int>? ExtensionDaysByDoc { get; set; }
 }
 
 // Extension Response
