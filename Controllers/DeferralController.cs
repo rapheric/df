@@ -2627,7 +2627,6 @@ public class DeferralController : ControllerBase
             if (deferral.Status != DeferralStatus.CloseRequested)
                 return BadRequest(new { error = "Deferral is not awaiting creator close-request approval" });
 
-            deferral.Status = DeferralStatus.CloseRequestedCreatorApproved;
             deferral.UpdatedAt = DateTime.UtcNow;
 
             var actorName = User.FindFirst(ClaimTypes.Name)?.Value ?? "Creator";
@@ -2642,6 +2641,9 @@ public class DeferralController : ControllerBase
                         item => item!,
                         StringComparer.OrdinalIgnoreCase);
 
+                    var hasRejectedDocuments = false;
+                    var hasPendingDocuments = false;
+
                 foreach (var closeRequestDocument in store.CloseRequestDocuments)
                 {
                     var key = NormalizeCloseRequestDocumentKey(closeRequestDocument.DocumentName);
@@ -2650,18 +2652,39 @@ public class DeferralController : ControllerBase
                         return BadRequest(new { error = $"Please review the uploaded close document for {closeRequestDocument.DocumentName}" });
                     }
 
-                    closeRequestDocument.CreatorStatus = string.Equals(decision.Status, "approved", StringComparison.OrdinalIgnoreCase)
+                    var normalizedDecision = string.Equals(decision.Status, "approved", StringComparison.OrdinalIgnoreCase)
                         ? "approved"
-                        : "pending";
+                        : string.Equals(decision.Status, "rejected", StringComparison.OrdinalIgnoreCase)
+                            ? "rejected"
+                            : "pending";
+
+                    closeRequestDocument.CreatorStatus = normalizedDecision;
                     closeRequestDocument.CreatorComment = decision.Comment?.Trim();
                     closeRequestDocument.CreatorReviewedByName = actorName;
                     closeRequestDocument.CreatorReviewedAt = DateTime.UtcNow;
+
+                    if (string.Equals(normalizedDecision, "rejected", StringComparison.OrdinalIgnoreCase))
+                    {
+                        hasRejectedDocuments = true;
+                    }
+                    else if (!string.Equals(normalizedDecision, "approved", StringComparison.OrdinalIgnoreCase))
+                    {
+                        hasPendingDocuments = true;
+                    }
                 }
 
-                if (store.CloseRequestDocuments.Any(document => !string.Equals(document.CreatorStatus, "approved", StringComparison.OrdinalIgnoreCase)))
+                if (hasPendingDocuments)
                 {
-                    return BadRequest(new { error = "All close request documents must be approved before forwarding to checker" });
+                    return BadRequest(new { error = "Please approve or reject every close request document before submitting your review" });
                 }
+
+                deferral.Status = hasRejectedDocuments
+                    ? DeferralStatus.CloseRequested
+                    : DeferralStatus.CloseRequestedCreatorApproved;
+            }
+            else
+            {
+                deferral.Status = DeferralStatus.CloseRequestedCreatorApproved;
             }
 
             if (!string.IsNullOrWhiteSpace(request?.Comment))
@@ -2685,31 +2708,36 @@ public class DeferralController : ControllerBase
             await _context.SaveChangesAsync();
             HydrateDeferralComments(deferral);
 
-            // Notify RM that close-request was approved by creator
-            try
+            // Notify RM only when the close request is fully approved and moved to checker
+            if (deferral.Status == DeferralStatus.CloseRequestedCreatorApproved)
             {
-                var rm = await _context.Users.FindAsync(deferral.CreatedById);
-                if (rm != null && !string.IsNullOrWhiteSpace(rm.Email))
+                try
                 {
-                    var rmName = string.IsNullOrWhiteSpace(rm.Name) ? "Relationship Manager" : rm.Name;
-                    await _emailService.SendDeferralApprovalConfirmationAsync(
-                        rm.Email,
-                        rmName,
-                        deferral.DeferralNumber,
-                        string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
-                        null,
-                        false);
+                    var rm = await _context.Users.FindAsync(deferral.CreatedById);
+                    if (rm != null && !string.IsNullOrWhiteSpace(rm.Email))
+                    {
+                        var rmName = string.IsNullOrWhiteSpace(rm.Name) ? "Relationship Manager" : rm.Name;
+                        await _emailService.SendDeferralApprovalConfirmationAsync(
+                            rm.Email,
+                            rmName,
+                            deferral.DeferralNumber,
+                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                            null,
+                            false);
+                    }
                 }
-            }
-            catch (Exception rmNotifyEx)
-            {
-                _logger.LogWarning(rmNotifyEx, "⚠️ Failed to notify RM after close-request creator approval for {DeferralNumber}", deferral.DeferralNumber);
+                catch (Exception rmNotifyEx)
+                {
+                    _logger.LogWarning(rmNotifyEx, "⚠️ Failed to notify RM after close-request creator approval for {DeferralNumber}", deferral.DeferralNumber);
+                }
             }
 
             return Ok(new
             {
                 success = true,
-                message = "Close request approved by creator",
+                message = deferral.Status == DeferralStatus.CloseRequestedCreatorApproved
+                    ? "Close request approved by creator and sent to checker"
+                    : "Creator review saved. Rejected documents remain pending RM correction",
                 deferral,
                 status = deferral.Status.ToString()
             });
@@ -3628,7 +3656,7 @@ public class DeferralController : ControllerBase
                 options
             ) ?? new List<SelectedDocumentData>();
         }
-        catch (Exception ex)
+        catch (Exception)
         {
             // If deserialization fails, return empty list
             deferral.SelectedDocuments = new List<SelectedDocumentData>();
