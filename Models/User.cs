@@ -23,6 +23,12 @@ public class User
 
     public bool Active { get; set; } = true;
 
+    public int FailedLoginAttempts { get; set; } = 0;
+
+    public bool IsPasswordLocked { get; set; } = false;
+
+    public DateTime? PasswordLockedAt { get; set; }
+
     public bool IsArchived { get; set; } = false;
 
     public string? Position { get; set; }

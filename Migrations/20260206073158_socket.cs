@@ -1,5 +1,6 @@
 ﻿using Microsoft.EntityFrameworkCore.Migrations;
 
+#pragma warning disable CS8981
 #nullable disable
 
 namespace NCBA.DCL.Migrations

@@ -22,7 +22,7 @@ namespace NCBA.DCL.Controllers
         }
 
         [HttpGet("logs")]
-        public async Task<IActionResult> GetLogs([FromQuery] int page = 1, [FromQuery] int limit = 20, [FromQuery] string action = null, [FromQuery] Guid? userId = null, [FromQuery] string resource = null, [FromQuery] string status = null, [FromQuery] DateTime? startDate = null, [FromQuery] DateTime? endDate = null, [FromQuery] string search = null)
+            public async Task<IActionResult> GetLogs([FromQuery] int page = 1, [FromQuery] int limit = 20, [FromQuery] string? action = null, [FromQuery] Guid? userId = null, [FromQuery] string? resource = null, [FromQuery] string? status = null, [FromQuery] DateTime? startDate = null, [FromQuery] DateTime? endDate = null, [FromQuery] string? search = null)
         {
             var result = await _auditLogService.GetLogsAsync(page, limit, action, userId, resource, status, startDate, endDate, search);
             return StatusCode(result.StatusCode, result.Body);
@@ -44,7 +44,7 @@ namespace NCBA.DCL.Controllers
         }
 
         [HttpGet("logs/export")]
-        public async Task<IActionResult> ExportLogs([FromQuery] string action = null, [FromQuery] Guid? userId = null, [FromQuery] string resource = null, [FromQuery] string status = null, [FromQuery] DateTime? startDate = null, [FromQuery] DateTime? endDate = null, [FromQuery] string search = null)
+            public async Task<IActionResult> ExportLogs([FromQuery] string? action = null, [FromQuery] Guid? userId = null, [FromQuery] string? resource = null, [FromQuery] string? status = null, [FromQuery] DateTime? startDate = null, [FromQuery] DateTime? endDate = null, [FromQuery] string? search = null)
         {
             var result = await _auditLogService.ExportLogsAsync(action, userId, resource, status, startDate, endDate, search);
             

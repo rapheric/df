@@ -55,6 +55,12 @@ public class UploadsController : ControllerBase
                 fileData = stream.ToArray();
             }
 
+            var userName =
+                User?.FindFirst("name")?.Value ??
+                User?.FindFirst("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name")?.Value ??
+                User?.Identity?.Name ??
+                "Unknown User";
+
             // Get user's role from claims
             var role = User?.FindFirst("role")?.Value ?? User?.FindFirst("http://schemas.microsoft.com/ws/2008/06/identity/claims/role")?.Value ?? "RM";
 
@@ -78,7 +84,7 @@ public class UploadsController : ControllerBase
                 FileUrl = null, // Will be set after saving
                 FileSize = dto.File.Length,
                 FileType = dto.File.ContentType,
-                UploadedBy = User?.Identity?.Name ?? "RM",
+                UploadedBy = userName,
                 UploadedByRole = role,
                 Status = "active",
                 CreatedAt = DateTime.UtcNow,

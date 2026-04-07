@@ -28,6 +28,201 @@ public class DeferralController : ControllerBase
         _emailService = emailService;
     }
 
+    [HttpPost("{id}/send-notification")]
+    public async Task<IActionResult> SendNotification(Guid id, [FromBody] SendDeferralNotificationRequest request)
+    {
+        try
+        {
+            var deferral = await _context.Deferrals
+                .Include(d => d.CreatedBy)
+                .Include(d => d.Approvers)
+                    .ThenInclude(a => a.User)
+                .FirstOrDefaultAsync(d => d.Id == id);
+
+            if (deferral == null)
+            {
+                return NotFound(new { error = "Deferral not found" });
+            }
+
+            var notificationType = (request.NotificationType ?? string.Empty).Trim().ToLowerInvariant();
+            if (string.IsNullOrWhiteSpace(notificationType))
+            {
+                return BadRequest(new { error = "notificationType is required" });
+            }
+
+            var recipients = ResolveNotificationRecipients(deferral, notificationType);
+            if (recipients.Count == 0)
+            {
+                return BadRequest(new { error = "No recipient email found for this notification" });
+            }
+
+            var sentCount = 0;
+            foreach (var recipient in recipients)
+            {
+                var sent = await SendNotificationToRecipientAsync(deferral, recipient, notificationType, request);
+                if (sent)
+                {
+                    sentCount++;
+                }
+            }
+
+            if (sentCount == 0)
+            {
+                return StatusCode(502, new
+                {
+                    success = false,
+                    message = "Notification request processed, but no emails were delivered. Configure SendGrid or restore outbound SMTP access.",
+                    attempted = recipients.Count,
+                    sent = 0
+                });
+            }
+
+            return Ok(new
+            {
+                success = true,
+                attempted = recipients.Count,
+                sent = sentCount
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error sending deferral notification for {DeferralId}", id);
+            return StatusCode(500, new { error = "Failed to send notification" });
+        }
+    }
+
+    private sealed class NotificationRecipient
+    {
+        public string Email { get; set; } = string.Empty;
+        public string Name { get; set; } = "User";
+        public string Role { get; set; } = "Approver";
+    }
+
+    private List<NotificationRecipient> ResolveNotificationRecipients(Deferral deferral, string notificationType)
+    {
+        var recipients = new List<NotificationRecipient>();
+
+        void AddRecipient(string? email, string? name, string? role)
+        {
+            if (string.IsNullOrWhiteSpace(email))
+            {
+                return;
+            }
+
+            if (recipients.Any(r => string.Equals(r.Email, email, StringComparison.OrdinalIgnoreCase)))
+            {
+                return;
+            }
+
+            recipients.Add(new NotificationRecipient
+            {
+                Email = email,
+                Name = string.IsNullOrWhiteSpace(name) ? "User" : name,
+                Role = string.IsNullOrWhiteSpace(role) ? "Approver" : role
+            });
+        }
+
+        var rm = deferral.CreatedBy;
+        var approvers = deferral.Approvers.OrderBy(a => a.Id).ToList();
+        var currentApprover = approvers.ElementAtOrDefault(deferral.CurrentApproverIndex) ?? approvers.FirstOrDefault();
+
+        if (notificationType.Contains("to_rm") || notificationType.Contains("approved_by") || notificationType.Contains("rejected") || notificationType.Contains("returned"))
+        {
+            AddRecipient(rm?.Email, rm?.Name, "Relationship Manager");
+            return recipients;
+        }
+
+        if (notificationType == "closed_to_all_parties")
+        {
+            AddRecipient(rm?.Email, rm?.Name, "Relationship Manager");
+            foreach (var approver in approvers)
+            {
+                AddRecipient(approver.User?.Email, approver.User?.Name ?? approver.Name, approver.Role);
+            }
+            return recipients;
+        }
+
+        if (notificationType == "reminder")
+        {
+            AddRecipient(currentApprover?.User?.Email, currentApprover?.User?.Name ?? currentApprover?.Name, currentApprover?.Role);
+            return recipients;
+        }
+
+        AddRecipient(currentApprover?.User?.Email, currentApprover?.User?.Name ?? currentApprover?.Name, currentApprover?.Role);
+        return recipients;
+    }
+
+    private async Task<bool> SendNotificationToRecipientAsync(Deferral deferral, NotificationRecipient recipient, string notificationType, SendDeferralNotificationRequest request)
+    {
+        var orderedApprovers = deferral.Approvers.OrderBy(a => a.Id).ToList();
+        var nextApproverName = orderedApprovers.ElementAtOrDefault(deferral.CurrentApproverIndex + 1)?.User?.Name;
+        var isFinalApproval = deferral.CurrentApproverIndex >= Math.Max(orderedApprovers.Count - 1, 0);
+        var actorName = string.IsNullOrWhiteSpace(request.UserName) ? "System" : request.UserName!;
+
+        return notificationType switch
+        {
+            "approved_by_creator" or "approved_by_checker" => await _emailService.SendDeferralApprovedToRmAsync(
+                recipient.Email,
+                recipient.Name,
+                deferral.DeferralNumber,
+                deferral.CustomerName ?? "Customer",
+                nextApproverName,
+                isFinalApproval),
+            "rejected_to_rm" => await _emailService.SendDeferralRejectedToRmAsync(
+                recipient.Email,
+                recipient.Name,
+                deferral.DeferralNumber,
+                deferral.CustomerName ?? "Customer",
+                request.Comment ?? "Rejected",
+                request.RejectedBy ?? actorName),
+            "returned_to_rm" => await _emailService.SendDeferralReturnedToRmAsync(
+                recipient.Email,
+                recipient.Name,
+                deferral.DeferralNumber,
+                deferral.CustomerName ?? "Customer",
+                request.Comment ?? "Returned for rework",
+                actorName),
+            "closed_to_all_parties" => await _emailService.SendDeferralClosedAsync(
+                recipient.Email,
+                recipient.Name,
+                deferral.DeferralNumber,
+                deferral.CustomerName ?? "Customer",
+                actorName,
+                request.Comment ?? "Deferral closed"),
+            "reminder" => await _emailService.SendDeferralReminderAsync(
+                recipient.Email,
+                recipient.Name,
+                deferral.DeferralNumber,
+                deferral.CustomerName ?? "Customer"),
+            _ => await _emailService.SendDeferralSubmittedAsync(
+                recipient.Email,
+                recipient.Name,
+                deferral.DeferralNumber,
+                deferral.CustomerName ?? "Customer",
+                deferral.DaysSought,
+                recipient.Role)
+        };
+    }
+
+    private async Task<bool> TrySendWorkflowEmailAsync(Func<Task<bool>> sendOperation, string failureMessage, params object[] args)
+    {
+        try
+        {
+            var sent = await sendOperation();
+            if (!sent)
+            {
+                _logger.LogWarning(failureMessage, args);
+            }
+
+            return sent;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, failureMessage, args);
+            return false;
+        }
+    }
+
     // ============================================
     // CREATE & BASIC OPERATIONS
     // ============================================
@@ -280,14 +475,22 @@ public class DeferralController : ControllerBase
 
                 foreach (var recipient in recipientDirectory)
                 {
-                    await _emailService.SendDeferralSubmittedAsync(
-                        recipient.Key,
-                        recipient.Value.Name,
+                    var sent = await TrySendWorkflowEmailAsync(
+                        () => _emailService.SendDeferralSubmittedAsync(
+                            recipient.Key,
+                            recipient.Value.Name,
+                            deferral.DeferralNumber,
+                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                            deferral.DaysSought,
+                            recipient.Value.Role),
+                        "⚠️ Deferral created but submit email delivery failed for {DeferralNumber} to {Recipient}",
                         deferral.DeferralNumber,
-                        string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
-                        deferral.DaysSought,
-                        recipient.Value.Role
-                    );
+                        recipient.Key);
+
+                    if (!sent)
+                    {
+                        emailDispatchError = true;
+                    }
                 }
 
                 _logger.LogInformation("📧 Submission emails queued for deferral {DeferralNumber}: {RecipientCount} recipient(s)",
@@ -692,8 +895,16 @@ public class DeferralController : ControllerBase
                     deferralNumber = d.DeferralNumber,
                     dclNumber = d.DclNumber,
                     dclNo = d.DclNumber,  // Support both naming conventions
-                    customerName = d.CreatedBy != null ? d.CreatedBy.Name : "Unknown",
-                    customerNumber = d.CreatedBy != null ? d.CreatedBy.CustomerNumber : null,
+                    customerName = !string.IsNullOrWhiteSpace(d.CustomerName)
+                        ? d.CustomerName
+                        : d.CreatedBy != null
+                            ? d.CreatedBy.Name
+                            : "Unknown",
+                    customerNumber = !string.IsNullOrWhiteSpace(d.CustomerNumber)
+                        ? d.CustomerNumber
+                        : d.CreatedBy != null
+                            ? d.CreatedBy.CustomerNumber
+                            : null,
                     loanType = d.LoanType,
                     status = d.Status.ToString(),
                     createdAt = d.CreatedAt
@@ -853,8 +1064,8 @@ public class DeferralController : ControllerBase
                     .ToHashSet();
 
                 _logger.LogWarning($"[DEFERRAL-DELETE-NORM] Normalized names to KEEP ({selectedDocumentNames.Count}): {string.Join(" | ", selectedDocumentNames)}");
-                _logger.LogWarning($"[DEFERRAL-DELETE-DB] Current DB has {deferral.Documents.Count} documents:");
-                foreach (var dbDoc in deferral.Documents)
+                _logger.LogWarning($"[DEFERRAL-DELETE-DB] Current DB has {deferral.Documents?.Count ?? 0} documents:");
+                foreach (var dbDoc in deferral.Documents ?? new List<DeferralDocument>())
                 {
                     var normName = (dbDoc.Name ?? "").Trim().ToLowerInvariant();
                     var shouldKeep = selectedDocumentNames.Contains(normName);
@@ -865,11 +1076,11 @@ public class DeferralController : ControllerBase
                 // Do NOT remove already-uploaded documents (those with a non-empty Url) unless
                 // the client explicitly indicates deletion. This preserves files in the
                 // Mandatory DCL / Additional sections after resubmission.
-                var documentsToRemove = deferral.Documents
+                var documentsToRemove = (deferral.Documents ?? new List<DeferralDocument>())
                     .Where(d => string.IsNullOrWhiteSpace(d.Url) && !selectedDocumentNames.Contains((d.Name ?? "").Trim().ToLowerInvariant()))
                     .ToList();
 
-                _logger.LogWarning($"[DEFERRAL-DELETE-ACTION] Will remove {documentsToRemove.Count} of {deferral.Documents.Count} documents");
+                _logger.LogWarning($"[DEFERRAL-DELETE-ACTION] Will remove {documentsToRemove.Count} of {deferral.Documents?.Count ?? 0} documents");
                 foreach (var docToRemove in documentsToRemove)
                 {
                     _logger.LogWarning($"[DEFERRAL-DELETE-ACTION]   Removing: '{docToRemove.Name}'");
@@ -891,7 +1102,7 @@ public class DeferralController : ControllerBase
                     if (string.IsNullOrWhiteSpace(selectedDoc.Name)) continue;
 
                     var selectedDocNameLower = selectedDoc.Name.Trim().ToLowerInvariant();
-                    var existingDoc = deferral.Documents.FirstOrDefault(d =>
+                    var existingDoc = (deferral.Documents ?? new List<DeferralDocument>()).FirstOrDefault(d =>
                         (d.Name ?? "").Trim().ToLowerInvariant() == selectedDocNameLower);
                     if (existingDoc != null)
                     {
@@ -1113,16 +1324,16 @@ public class DeferralController : ControllerBase
             deferral.UpdatedAt = DateTime.UtcNow;
 
             // Log state before SaveChanges
-            _logger.LogWarning($"[DEFERRAL-DELETE-SAVE] Before SaveChanges: Deferral has {deferral.Documents.Count} documents");
-            foreach (var doc in deferral.Documents)
+            _logger.LogWarning($"[DEFERRAL-DELETE-SAVE] Before SaveChanges: Deferral has {deferral.Documents?.Count ?? 0} documents");
+            foreach (var doc in deferral.Documents ?? new List<DeferralDocument>())
             {
                 _logger.LogWarning($"[DEFERRAL-DELETE-SAVE]   - '{doc.Name}' (EntityState: {_context.Entry(doc).State})");
             }
 
             await _context.SaveChangesAsync();
 
-            _logger.LogWarning($"[DEFERRAL-DELETE-SAVE] After SaveChanges: Deferral has {deferral.Documents.Count} documents");
-            foreach (var doc in deferral.Documents)
+            _logger.LogWarning($"[DEFERRAL-DELETE-SAVE] After SaveChanges: Deferral has {deferral.Documents?.Count ?? 0} documents");
+            foreach (var doc in deferral.Documents ?? new List<DeferralDocument>())
             {
                 _logger.LogWarning($"[DEFERRAL-DELETE-SAVE]   - '{doc.Name}' (EntityState: {_context.Entry(doc).State})");
             }
@@ -1147,24 +1358,30 @@ public class DeferralController : ControllerBase
 
                     if (!string.IsNullOrWhiteSpace(previousFirstApprover?.Email))
                     {
-                        await _emailService.SendFirstApproverReplacedAsync(
-                            previousFirstApprover.Email,
-                            previousName,
-                            deferralNumber,
-                            customerName,
-                            updatedName
-                        );
+                        await TrySendWorkflowEmailAsync(
+                            () => _emailService.SendFirstApproverReplacedAsync(
+                                previousFirstApprover.Email,
+                                previousName,
+                                deferralNumber,
+                                customerName,
+                                updatedName),
+                            "⚠️ Approval flow updated for deferral {DeferralNumber}, but failed to notify replaced first approver {Recipient}",
+                            deferral.DeferralNumber,
+                            previousFirstApprover.Email);
                     }
 
                     if (!string.IsNullOrWhiteSpace(updatedFirstApprover?.Email))
                     {
-                        await _emailService.SendFirstApproverAssignedAsync(
-                            updatedFirstApprover.Email,
-                            updatedName,
-                            deferralNumber,
-                            customerName,
-                            previousName
-                        );
+                        await TrySendWorkflowEmailAsync(
+                            () => _emailService.SendFirstApproverAssignedAsync(
+                                updatedFirstApprover.Email,
+                                updatedName,
+                                deferralNumber,
+                                customerName,
+                                previousName),
+                            "⚠️ Approval flow updated for deferral {DeferralNumber}, but failed to notify new first approver {Recipient}",
+                            deferral.DeferralNumber,
+                            updatedFirstApprover.Email);
                     }
                 }
                 catch (Exception emailEx)
@@ -1199,14 +1416,17 @@ public class DeferralController : ControllerBase
                             ? "Approver"
                             : currentPendingApproverRole;
 
-                        await _emailService.SendDeferralSubmittedAsync(
-                            pendingApproverUser.Email,
-                            pendingApproverName,
-                            string.IsNullOrWhiteSpace(deferral.DeferralNumber) ? "DEFERRAL" : deferral.DeferralNumber,
-                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
-                            deferral.DaysSought,
-                            pendingApproverRole
-                        );
+                        await TrySendWorkflowEmailAsync(
+                            () => _emailService.SendDeferralSubmittedAsync(
+                                pendingApproverUser.Email,
+                                pendingApproverName,
+                                string.IsNullOrWhiteSpace(deferral.DeferralNumber) ? "DEFERRAL" : deferral.DeferralNumber,
+                                string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                                deferral.DaysSought,
+                                pendingApproverRole),
+                            "⚠️ Approval flow updated for deferral {DeferralNumber}, but failed to notify pending approver {Recipient}",
+                            deferral.DeferralNumber,
+                            pendingApproverUser.Email);
                     }
                 }
                 catch (Exception pendingApproverEmailEx)
@@ -1598,21 +1818,21 @@ public class DeferralController : ControllerBase
                         ?? nextApprover?.User?.Name
                         ?? nextApprover?.User?.Email;
 
-                    await _emailService.SendDeferralApprovalConfirmationAsync(
-                        approverEmail,
-                        approverName,
-                        deferral.DeferralNumber,
-                        string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
-                        nextApproverName,
-                        isFinalApproval: !hasNextApprover
-                    );
-
-                    approvalEmailSent = true;
+                    approvalEmailSent = await TrySendWorkflowEmailAsync(
+                        () => _emailService.SendDeferralApprovalConfirmationAsync(
+                            approverEmail,
+                            approverName,
+                            deferral.DeferralNumber,
+                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                            nextApproverName,
+                            isFinalApproval: !hasNextApprover),
+                        "⚠️ Deferral approved but failed to send approval confirmation email for {DeferralNumber}",
+                        deferral.DeferralNumber);
                 }
             }
             catch (Exception emailEx)
             {
-                _logger.LogWarning(emailEx, "⚠️ Deferral approved but failed to send approval confirmation email for {DeferralNumber}", deferral.DeferralNumber);
+                _logger.LogWarning(emailEx, "⚠️ Deferral approved but failed to prepare approval confirmation email for {DeferralNumber}", deferral.DeferralNumber);
             }
 
             try
@@ -1633,22 +1853,22 @@ public class DeferralController : ControllerBase
                             ? "Approver"
                             : nextApprover!.Role!;
 
-                        await _emailService.SendDeferralSubmittedAsync(
-                            nextApproverEmail,
-                            nextApproverName,
-                            deferral.DeferralNumber,
-                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
-                            deferral.DaysSought,
-                            nextApproverRole
-                        );
-
-                        nextApproverEmailSent = true;
+                        nextApproverEmailSent = await TrySendWorkflowEmailAsync(
+                            () => _emailService.SendDeferralSubmittedAsync(
+                                nextApproverEmail,
+                                nextApproverName,
+                                deferral.DeferralNumber,
+                                string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                                deferral.DaysSought,
+                                nextApproverRole),
+                            "⚠️ Deferral approved but failed to notify next approver for {DeferralNumber}",
+                            deferral.DeferralNumber);
                     }
                 }
             }
             catch (Exception emailEx)
             {
-                _logger.LogWarning(emailEx, "⚠️ Deferral approved but failed to notify next approver for {DeferralNumber}", deferral.DeferralNumber);
+                _logger.LogWarning(emailEx, "⚠️ Deferral approved but failed to prepare next approver email for {DeferralNumber}", deferral.DeferralNumber);
             }
 
             // Notify RM that an approver has approved and where the deferral moved next
@@ -1658,19 +1878,21 @@ public class DeferralController : ControllerBase
                 if (rm != null && !string.IsNullOrWhiteSpace(rm.Email))
                 {
                     var rmName = string.IsNullOrWhiteSpace(rm.Name) ? "Relationship Manager" : rm.Name;
-                    await _emailService.SendDeferralApprovalConfirmationAsync(
-                        rm.Email,
-                        rmName,
-                        deferral.DeferralNumber,
-                        string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
-                        nextApprover?.Name ?? nextApprover?.User?.Name,
-                        !hasNextApprover
-                    );
+                    await TrySendWorkflowEmailAsync(
+                        () => _emailService.SendDeferralApprovalConfirmationAsync(
+                            rm.Email,
+                            rmName,
+                            deferral.DeferralNumber,
+                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                            nextApprover?.Name ?? nextApprover?.User?.Name,
+                            !hasNextApprover),
+                        "⚠️ Deferral approved but failed to notify RM for {DeferralNumber}",
+                        deferral.DeferralNumber);
                 }
             }
             catch (Exception rmEmailEx)
             {
-                _logger.LogWarning(rmEmailEx, "⚠️ Deferral approved but failed to notify RM for {DeferralNumber}", deferral.DeferralNumber);
+                _logger.LogWarning(rmEmailEx, "⚠️ Deferral approved but failed to prepare RM email for {DeferralNumber}", deferral.DeferralNumber);
             }
 
 
@@ -1774,18 +1996,21 @@ public class DeferralController : ControllerBase
                 if (rm != null && !string.IsNullOrWhiteSpace(rm.Email))
                 {
                     var rmName = string.IsNullOrWhiteSpace(rm.Name) ? "Relationship Manager" : rm.Name;
-                    await _emailService.SendDeferralApprovalConfirmationAsync(
-                        rm.Email,
-                        rmName,
-                        deferral.DeferralNumber,
-                        string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
-                        null,
-                        false);
+                    await TrySendWorkflowEmailAsync(
+                        () => _emailService.SendDeferralApprovalConfirmationAsync(
+                            rm.Email,
+                            rmName,
+                            deferral.DeferralNumber,
+                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                            null,
+                            false),
+                        "⚠️ Failed to notify RM after creator approval for {DeferralNumber}",
+                        deferral.DeferralNumber);
                 }
             }
             catch (Exception rmNotifyEx)
             {
-                _logger.LogWarning(rmNotifyEx, "⚠️ Failed to notify RM after creator approval for {DeferralNumber}", deferral.DeferralNumber);
+                _logger.LogWarning(rmNotifyEx, "⚠️ Failed to prepare RM email after creator approval for {DeferralNumber}", deferral.DeferralNumber);
             }
 
             return Ok(new
@@ -1875,18 +2100,21 @@ public class DeferralController : ControllerBase
                 if (rm != null && !string.IsNullOrWhiteSpace(rm.Email))
                 {
                     var rmName = string.IsNullOrWhiteSpace(rm.Name) ? "Relationship Manager" : rm.Name;
-                    await _emailService.SendDeferralApprovalConfirmationAsync(
-                        rm.Email,
-                        rmName,
-                        deferral.DeferralNumber,
-                        string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
-                        null,
-                        true);
+                    await TrySendWorkflowEmailAsync(
+                        () => _emailService.SendDeferralApprovalConfirmationAsync(
+                            rm.Email,
+                            rmName,
+                            deferral.DeferralNumber,
+                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                            null,
+                            true),
+                        "⚠️ Failed to notify RM after checker approval for {DeferralNumber}",
+                        deferral.DeferralNumber);
                 }
             }
             catch (Exception rmNotifyEx)
             {
-                _logger.LogWarning(rmNotifyEx, "⚠️ Failed to notify RM after checker approval for {DeferralNumber}", deferral.DeferralNumber);
+                _logger.LogWarning(rmNotifyEx, "⚠️ Failed to prepare RM email after checker approval for {DeferralNumber}", deferral.DeferralNumber);
             }
 
             return Ok(new
@@ -1954,18 +2182,19 @@ public class DeferralController : ControllerBase
                 if (!string.IsNullOrWhiteSpace(currentApprover.User?.Email))
                 {
                     reminderEmailAttempted = true;
-                    await _emailService.SendDeferralReminderAsync(
-                        currentApprover.User.Email,
-                        string.IsNullOrWhiteSpace(currentApprover.Name) ? "Approver" : currentApprover.Name,
-                        deferral.DeferralNumber,
-                        string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName
-                    );
-                    reminderEmailSent = true;
+                    reminderEmailSent = await TrySendWorkflowEmailAsync(
+                        () => _emailService.SendDeferralReminderAsync(
+                            currentApprover.User.Email,
+                            string.IsNullOrWhiteSpace(currentApprover.Name) ? "Approver" : currentApprover.Name,
+                            deferral.DeferralNumber,
+                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName),
+                        "⚠️ Reminder in-app notification saved, but email failed for deferral {DeferralNumber}",
+                        deferral.DeferralNumber);
                 }
             }
             catch (Exception emailEx)
             {
-                _logger.LogWarning(emailEx, "⚠️ Reminder in-app notification saved, but email failed for deferral {DeferralNumber}", deferral.DeferralNumber);
+                _logger.LogWarning(emailEx, "⚠️ Reminder in-app notification saved, but email preparation failed for deferral {DeferralNumber}", deferral.DeferralNumber);
             }
 
             await _context.SaveChangesAsync();
@@ -2220,20 +2449,21 @@ public class DeferralController : ControllerBase
                 if (!string.IsNullOrWhiteSpace(deferral.CreatedBy?.Email))
                 {
                     rmEmailAttempted = true;
-                    await _emailService.SendDeferralRejectedToRmAsync(
-                        deferral.CreatedBy.Email,
-                        string.IsNullOrWhiteSpace(deferral.CreatedBy.Name) ? "RM" : deferral.CreatedBy.Name,
-                        deferral.DeferralNumber,
-                        string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
-                        deferral.RejectionReason ?? "No reason provided",
-                        rejectingApproverName
-                    );
-                    rmEmailSent = true;
+                    rmEmailSent = await TrySendWorkflowEmailAsync(
+                        () => _emailService.SendDeferralRejectedToRmAsync(
+                            deferral.CreatedBy.Email,
+                            string.IsNullOrWhiteSpace(deferral.CreatedBy.Name) ? "RM" : deferral.CreatedBy.Name,
+                            deferral.DeferralNumber,
+                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                            deferral.RejectionReason ?? "No reason provided",
+                            rejectingApproverName),
+                        "⚠️ Deferral rejected but failed to send rejection email to RM for {DeferralNumber}",
+                        deferral.DeferralNumber);
                 }
             }
             catch (Exception rmEmailEx)
             {
-                _logger.LogWarning(rmEmailEx, "⚠️ Deferral rejected but failed to send rejection email to RM for {DeferralNumber}", deferral.DeferralNumber);
+                _logger.LogWarning(rmEmailEx, "⚠️ Deferral rejected but failed to prepare rejection email to RM for {DeferralNumber}", deferral.DeferralNumber);
             }
 
             try
@@ -2241,19 +2471,20 @@ public class DeferralController : ControllerBase
                 if (!string.IsNullOrWhiteSpace(rejectingApproverEmail))
                 {
                     approverEmailAttempted = true;
-                    await _emailService.SendDeferralRejectConfirmationAsync(
-                        rejectingApproverEmail,
-                        rejectingApproverName,
-                        deferral.DeferralNumber,
-                        string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
-                        deferral.RejectionReason ?? "No reason provided"
-                    );
-                    approverEmailSent = true;
+                    approverEmailSent = await TrySendWorkflowEmailAsync(
+                        () => _emailService.SendDeferralRejectConfirmationAsync(
+                            rejectingApproverEmail,
+                            rejectingApproverName,
+                            deferral.DeferralNumber,
+                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                            deferral.RejectionReason ?? "No reason provided"),
+                        "⚠️ Deferral rejected but failed to send confirmation email to rejecting approver for {DeferralNumber}",
+                        deferral.DeferralNumber);
                 }
             }
             catch (Exception approverEmailEx)
             {
-                _logger.LogWarning(approverEmailEx, "⚠️ Deferral rejected but failed to send confirmation email to rejecting approver for {DeferralNumber}", deferral.DeferralNumber);
+                _logger.LogWarning(approverEmailEx, "⚠️ Deferral rejected but failed to prepare confirmation email to rejecting approver for {DeferralNumber}", deferral.DeferralNumber);
             }
 
             _logger.LogInformation($"❌ Deferral {deferral.DeferralNumber} rejected");
@@ -2388,20 +2619,21 @@ public class DeferralController : ControllerBase
                 if (!string.IsNullOrWhiteSpace(deferral.CreatedBy?.Email))
                 {
                     rmEmailAttempted = true;
-                    await _emailService.SendDeferralReturnedToRmAsync(
-                        deferral.CreatedBy.Email,
-                        string.IsNullOrWhiteSpace(deferral.CreatedBy.Name) ? "RM" : deferral.CreatedBy.Name,
-                        deferral.DeferralNumber,
-                        string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
-                        reworkComment,
-                        returningApproverName
-                    );
-                    rmEmailSent = true;
+                    rmEmailSent = await TrySendWorkflowEmailAsync(
+                        () => _emailService.SendDeferralReturnedToRmAsync(
+                            deferral.CreatedBy.Email,
+                            string.IsNullOrWhiteSpace(deferral.CreatedBy.Name) ? "RM" : deferral.CreatedBy.Name,
+                            deferral.DeferralNumber,
+                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                            reworkComment,
+                            returningApproverName),
+                        "⚠️ Deferral returned for rework but failed to send notification email to RM for {DeferralNumber}",
+                        deferral.DeferralNumber);
                 }
             }
             catch (Exception rmEmailEx)
             {
-                _logger.LogWarning(rmEmailEx, "⚠️ Deferral returned for rework but failed to send notification email to RM for {DeferralNumber}", deferral.DeferralNumber);
+                _logger.LogWarning(rmEmailEx, "⚠️ Deferral returned for rework but failed to prepare notification email to RM for {DeferralNumber}", deferral.DeferralNumber);
             }
 
             try
@@ -2409,19 +2641,20 @@ public class DeferralController : ControllerBase
                 if (!string.IsNullOrWhiteSpace(returningApproverEmail))
                 {
                     approverEmailAttempted = true;
-                    await _emailService.SendDeferralReturnConfirmationAsync(
-                        returningApproverEmail,
-                        returningApproverName,
-                        deferral.DeferralNumber,
-                        string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
-                        reworkComment
-                    );
-                    approverEmailSent = true;
+                    approverEmailSent = await TrySendWorkflowEmailAsync(
+                        () => _emailService.SendDeferralReturnConfirmationAsync(
+                            returningApproverEmail,
+                            returningApproverName,
+                            deferral.DeferralNumber,
+                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                            reworkComment),
+                        "⚠️ Deferral returned for rework but failed to send confirmation email to returning approver for {DeferralNumber}",
+                        deferral.DeferralNumber);
                 }
             }
             catch (Exception approverEmailEx)
             {
-                _logger.LogWarning(approverEmailEx, "⚠️ Deferral returned for rework but failed to send confirmation email to returning approver for {DeferralNumber}", deferral.DeferralNumber);
+                _logger.LogWarning(approverEmailEx, "⚠️ Deferral returned for rework but failed to prepare confirmation email to returning approver for {DeferralNumber}", deferral.DeferralNumber);
             }
 
             _logger.LogInformation($"🔄 Deferral {deferral.DeferralNumber} returned for rework");
@@ -2564,19 +2797,21 @@ public class DeferralController : ControllerBase
                 if (rm != null && !string.IsNullOrWhiteSpace(rm.Email))
                 {
                     var rmName = string.IsNullOrWhiteSpace(rm.Name) ? "Relationship Manager" : rm.Name;
-                    await _emailService.SendDeferralSubmittedAsync(
-                        rm.Email,
-                        rmName,
-                        deferral.DeferralNumber,
-                        string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
-                        deferral.DaysSought,
-                        "Close Request"
-                    );
+                    await TrySendWorkflowEmailAsync(
+                        () => _emailService.SendDeferralSubmittedAsync(
+                            rm.Email,
+                            rmName,
+                            deferral.DeferralNumber,
+                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                            deferral.DaysSought,
+                            "Close Request"),
+                        "⚠️ Failed to notify RM after close request submission for {DeferralNumber}",
+                        deferral.DeferralNumber);
                 }
             }
             catch (Exception rmCloseEx)
             {
-                _logger.LogWarning(rmCloseEx, "⚠️ Failed to notify RM after close request submission for {DeferralNumber}", deferral.DeferralNumber);
+                _logger.LogWarning(rmCloseEx, "⚠️ Failed to prepare RM email after close request submission for {DeferralNumber}", deferral.DeferralNumber);
             }
 
             _logger.LogInformation(
@@ -2717,18 +2952,21 @@ public class DeferralController : ControllerBase
                     if (rm != null && !string.IsNullOrWhiteSpace(rm.Email))
                     {
                         var rmName = string.IsNullOrWhiteSpace(rm.Name) ? "Relationship Manager" : rm.Name;
-                        await _emailService.SendDeferralApprovalConfirmationAsync(
-                            rm.Email,
-                            rmName,
-                            deferral.DeferralNumber,
-                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
-                            null,
-                            false);
+                        await TrySendWorkflowEmailAsync(
+                            () => _emailService.SendDeferralApprovalConfirmationAsync(
+                                rm.Email,
+                                rmName,
+                                deferral.DeferralNumber,
+                                string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                                null,
+                                false),
+                            "⚠️ Failed to notify RM after close-request creator approval for {DeferralNumber}",
+                            deferral.DeferralNumber);
                     }
                 }
                 catch (Exception rmNotifyEx)
                 {
-                    _logger.LogWarning(rmNotifyEx, "⚠️ Failed to notify RM after close-request creator approval for {DeferralNumber}", deferral.DeferralNumber);
+                    _logger.LogWarning(rmNotifyEx, "⚠️ Failed to prepare RM email after close-request creator approval for {DeferralNumber}", deferral.DeferralNumber);
                 }
             }
 
@@ -2818,18 +3056,21 @@ public class DeferralController : ControllerBase
                 if (rm != null && !string.IsNullOrWhiteSpace(rm.Email))
                 {
                     var rmName = string.IsNullOrWhiteSpace(rm.Name) ? "Relationship Manager" : rm.Name;
-                    await _emailService.SendDeferralApprovalConfirmationAsync(
-                        rm.Email,
-                        rmName,
-                        deferral.DeferralNumber,
-                        string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
-                        null,
-                        true);
+                    await TrySendWorkflowEmailAsync(
+                        () => _emailService.SendDeferralApprovalConfirmationAsync(
+                            rm.Email,
+                            rmName,
+                            deferral.DeferralNumber,
+                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                            null,
+                            true),
+                        "⚠️ Failed to notify RM after close-request checker approval for {DeferralNumber}",
+                        deferral.DeferralNumber);
                 }
             }
             catch (Exception rmNotifyEx)
             {
-                _logger.LogWarning(rmNotifyEx, "⚠️ Failed to notify RM after close-request checker approval for {DeferralNumber}", deferral.DeferralNumber);
+                _logger.LogWarning(rmNotifyEx, "⚠️ Failed to prepare RM email after close-request checker approval for {DeferralNumber}", deferral.DeferralNumber);
             }
 
             return Ok(new
@@ -2953,19 +3194,21 @@ public class DeferralController : ControllerBase
                 if (rm != null && !string.IsNullOrWhiteSpace(rm.Email))
                 {
                     var rmName = string.IsNullOrWhiteSpace(rm.Name) ? "Relationship Manager" : rm.Name;
-                    await _emailService.SendDeferralSubmittedAsync(
-                        rm.Email,
-                        rmName,
-                        deferral.DeferralNumber,
-                        string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
-                        deferral.DaysSought,
-                        "Withdrawn"
-                    );
+                    await TrySendWorkflowEmailAsync(
+                        () => _emailService.SendDeferralSubmittedAsync(
+                            rm.Email,
+                            rmName,
+                            deferral.DeferralNumber,
+                            string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName,
+                            deferral.DaysSought,
+                            "Withdrawn"),
+                        "⚠️ Failed to notify RM after withdrawal for {DeferralNumber}",
+                        deferral.DeferralNumber);
                 }
             }
             catch (Exception rmCloseEx)
             {
-                _logger.LogWarning(rmCloseEx, "⚠️ Failed to notify RM after withdrawal for {DeferralNumber}", deferral.DeferralNumber);
+                _logger.LogWarning(rmCloseEx, "⚠️ Failed to prepare RM email after withdrawal for {DeferralNumber}", deferral.DeferralNumber);
             }
 
             HydrateDeferralComments(deferral);
@@ -3317,6 +3560,15 @@ public class DeferralController : ControllerBase
 
         var previousCurrentApprover = previousApprovers.FirstOrDefault(a => a.UserId == previousCurrentApproverUserId);
         var currentPendingApprover = updatedApprovers.FirstOrDefault(a => a.UserId == currentPendingApproverUserId);
+        var involvedUserIds = previousApproverIds
+            .Concat(updatedApproverIds)
+            .Distinct()
+            .ToList();
+        var usersById = involvedUserIds.Count == 0
+            ? new Dictionary<Guid, User>()
+            : await _context.Users
+                .Where(u => involvedUserIds.Contains(u.Id))
+                .ToDictionaryAsync(u => u.Id);
 
         var auditParts = new List<string> { $"Approval flow updated by {actorName}." };
         if (addedApprovers.Count > 0)
@@ -3411,6 +3663,121 @@ public class DeferralController : ControllerBase
         if (notifications.Count > 0)
         {
             _context.Notifications.AddRange(notifications);
+        }
+
+        var emailedUsers = new HashSet<Guid>();
+        var customerName = string.IsNullOrWhiteSpace(deferral.CustomerName) ? "Customer" : deferral.CustomerName;
+        var currentApproverDisplayName = string.IsNullOrWhiteSpace(currentPendingApprover?.Name)
+            ? usersById.TryGetValue(currentPendingApproverUserId ?? Guid.Empty, out var pendingUser) ? pendingUser.Name : null
+            : currentPendingApprover.Name;
+        var removedApproverIds = removedApprovers
+            .Where(a => a.UserId.HasValue)
+            .Select(a => a.UserId!.Value)
+            .ToHashSet();
+
+        async Task NotifyUserByEmailAsync(Guid? userId, Func<User, Task<bool>> sendOperation, string failureMessage, params object[] args)
+        {
+            if (!userId.HasValue || !emailedUsers.Add(userId.Value))
+            {
+                return;
+            }
+
+            if (!usersById.TryGetValue(userId.Value, out var user) || string.IsNullOrWhiteSpace(user.Email))
+            {
+                return;
+            }
+
+            await TrySendWorkflowEmailAsync(() => sendOperation(user), failureMessage, args);
+        }
+
+        if (previousCurrentApproverUserId != currentPendingApproverUserId)
+        {
+            if (removedApproverIds.Contains(previousCurrentApproverUserId ?? Guid.Empty))
+            {
+                await NotifyUserByEmailAsync(
+                    previousCurrentApproverUserId,
+                    user => _emailService.SendApprovalFlowRemovedAsync(
+                        user.Email,
+                        string.IsNullOrWhiteSpace(user.Name) ? "Approver" : user.Name,
+                        deferral.DeferralNumber,
+                        customerName,
+                        currentApproverDisplayName),
+                    "⚠️ Approval flow updated for deferral {DeferralNumber}, but failed to email removed approver {Recipient}",
+                    deferral.DeferralNumber,
+                    previousCurrentApproverUserId?.ToString() ?? "unknown");
+            }
+            else
+            {
+                await NotifyUserByEmailAsync(
+                    previousCurrentApproverUserId,
+                    user => _emailService.SendApprovalFlowStepUpdatedAsync(
+                        user.Email,
+                        string.IsNullOrWhiteSpace(user.Name) ? "Approver" : user.Name,
+                        deferral.DeferralNumber,
+                        customerName,
+                        NormalizeRoleLabel(previousCurrentApprover?.Role)),
+                    "⚠️ Approval flow updated for deferral {DeferralNumber}, but failed to email previous current approver {Recipient}",
+                    deferral.DeferralNumber,
+                    previousCurrentApproverUserId?.ToString() ?? "unknown");
+            }
+
+            await NotifyUserByEmailAsync(
+                currentPendingApproverUserId,
+                user => _emailService.SendDeferralSubmittedAsync(
+                    user.Email,
+                    string.IsNullOrWhiteSpace(user.Name) ? "Approver" : user.Name,
+                    deferral.DeferralNumber,
+                    customerName,
+                    deferral.DaysSought,
+                    NormalizeRoleLabel(currentPendingApprover?.Role ?? currentPendingApproverRole)),
+                "⚠️ Approval flow updated for deferral {DeferralNumber}, but failed to email the current approver {Recipient}",
+                deferral.DeferralNumber,
+                currentPendingApproverUserId?.ToString() ?? "unknown");
+        }
+
+        foreach (var removedApprover in removedApprovers)
+        {
+            await NotifyUserByEmailAsync(
+                removedApprover.UserId,
+                user => _emailService.SendApprovalFlowRemovedAsync(
+                    user.Email,
+                    string.IsNullOrWhiteSpace(user.Name) ? "Approver" : user.Name,
+                    deferral.DeferralNumber,
+                    customerName,
+                    currentApproverDisplayName),
+                "⚠️ Approval flow updated for deferral {DeferralNumber}, but failed to email removed approver {Recipient}",
+                deferral.DeferralNumber,
+                removedApprover.UserId?.ToString() ?? "unknown");
+        }
+
+        foreach (var addedApprover in addedApprovers)
+        {
+            await NotifyUserByEmailAsync(
+                addedApprover.UserId,
+                user => _emailService.SendApprovalFlowAddedAsync(
+                    user.Email,
+                    string.IsNullOrWhiteSpace(user.Name) ? "Approver" : user.Name,
+                    deferral.DeferralNumber,
+                    customerName,
+                    NormalizeRoleLabel(addedApprover.Role)),
+                "⚠️ Approval flow updated for deferral {DeferralNumber}, but failed to email added approver {Recipient}",
+                deferral.DeferralNumber,
+                addedApprover.UserId?.ToString() ?? "unknown");
+        }
+
+        foreach (var movedApprover in movedApprovers)
+        {
+            await NotifyUserByEmailAsync(
+                movedApprover.UserId,
+                user => _emailService.SendApprovalFlowStepUpdatedAsync(
+                    user.Email,
+                    string.IsNullOrWhiteSpace(user.Name) ? "Approver" : user.Name,
+                    deferral.DeferralNumber,
+                    customerName,
+                    NormalizeRoleLabel(movedApprover.Role)),
+                "⚠️ Approval flow updated for deferral {DeferralNumber}, but failed to email moved approver {Recipient}",
+                deferral.DeferralNumber,
+                movedApprover.UserId?.ToString() ?? "unknown");
         }
     }
 
@@ -3619,9 +3986,20 @@ public class DeferralController : ControllerBase
                 deferral.CreatorApprovalDate = deferral.UpdatedAt;
                 break;
 
-            case DeferralStatus.Approved:
             case DeferralStatus.CloseRequested:
+                deferral.CreatorApprovalStatus = "pending";
+                deferral.CheckerApprovalStatus = "pending";
+                deferral.DeferralApprovalStatus = "pending";
+                break;
+
             case DeferralStatus.CloseRequestedCreatorApproved:
+                deferral.CreatorApprovalStatus = "approved";
+                deferral.CheckerApprovalStatus = "pending";
+                deferral.DeferralApprovalStatus = "pending";
+                deferral.CreatorApprovalDate = deferral.UpdatedAt;
+                break;
+
+            case DeferralStatus.Approved:
             case DeferralStatus.Closed:
                 deferral.CreatorApprovalStatus = "approved";
                 deferral.CheckerApprovalStatus = "approved";
@@ -3763,6 +4141,14 @@ public class ApproverRequest
     public string? Role { get; set; }
     public Guid? UserId { get; set; }
     public Guid? User { get; set; }
+}
+
+public class SendDeferralNotificationRequest
+{
+    public string? NotificationType { get; set; }
+    public string? Comment { get; set; }
+    public string? UserName { get; set; }
+    public string? RejectedBy { get; set; }
 }
 
 public class SelectedDocumentRequest

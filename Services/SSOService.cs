@@ -171,6 +171,12 @@ public class SSOService : ISSOService
                     var root = doc.RootElement;
                     var accessToken = root.GetProperty("access_token").GetString();
 
+                        if (string.IsNullOrWhiteSpace(accessToken))
+                        {
+                            _logger.LogWarning("Provider {ProviderId} returned an empty access token", providerId);
+                            return (false, null, false, "Provider did not return a valid access token");
+                        }
+
                     // Get user info
                     var userInfoEndpoint = provider.UserInfoEndpoint ?? provider.Authority + "/userinfo";
                     var userInfoRequest = new HttpRequestMessage(HttpMethod.Get, userInfoEndpoint);
@@ -449,6 +455,12 @@ public class SSOService : ISSOService
                     var root = doc.RootElement;
                     var accessToken = root.GetProperty("access_token").GetString();
                     var expiresIn = root.TryGetProperty("expires_in", out var expiresProp) ? expiresProp.GetInt32() : 3600;
+
+                        if (string.IsNullOrWhiteSpace(accessToken))
+                        {
+                            _logger.LogWarning("Provider refresh for connection {ConnectionId} returned an empty access token", connectionId);
+                            return false;
+                        }
 
                     connection.AccessToken = EncryptSecret(accessToken);
                     connection.TokenExpiresAt = DateTime.UtcNow.AddSeconds(expiresIn);

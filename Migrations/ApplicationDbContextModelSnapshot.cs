@@ -1300,6 +1300,9 @@ namespace NCBA.DCL.Migrations
                         .HasMaxLength(255)
                         .HasColumnType("varchar(255)");
 
+                    b.Property<int>("FailedLoginAttempts")
+                        .HasColumnType("int");
+
                     b.Property<bool>("EmailVerified")
                         .HasColumnType("tinyint(1)");
 
@@ -1318,6 +1321,9 @@ namespace NCBA.DCL.Migrations
                     b.Property<bool>("IsOnline")
                         .HasColumnType("tinyint(1)");
 
+                    b.Property<bool>("IsPasswordLocked")
+                        .HasColumnType("tinyint(1)");
+
                     b.Property<DateTime>("LastSeen")
                         .HasColumnType("datetime(6)");
 
@@ -1332,6 +1338,9 @@ namespace NCBA.DCL.Migrations
                     b.Property<string>("Password")
                         .IsRequired()
                         .HasColumnType("longtext");
+
+                    b.Property<DateTime?>("PasswordLockedAt")
+                        .HasColumnType("datetime(6)");
 
                     b.Property<string>("Position")
                         .HasColumnType("longtext");

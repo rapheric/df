@@ -198,6 +198,9 @@ public class DocumentUpdateInSubmitDto
     [JsonPropertyName("creatorStatus")]
     public string? CreatorStatus { get; set; }
 
+    [JsonPropertyName("rmStatus")]
+    public string? RmStatus { get; set; }
+
     [JsonPropertyName("comment")]
     public string? Comment { get; set; }
 
@@ -213,6 +216,12 @@ public class DocumentUpdateInSubmitDto
 
 public class RmDocumentUpdateDto
 {
+    [JsonPropertyName("id")]
+    public Guid? Id { get; set; }
+
+    [JsonPropertyName("_id")]
+    public Guid? _id { get; set; }
+
     [JsonPropertyName("category")]
     public string? Category { get; set; }
 
@@ -220,12 +229,10 @@ public class RmDocumentUpdateDto
     public string? Action { get; set; }
 
     [JsonPropertyName("status")]
-    [JsonConverter(typeof(JsonStringEnumConverter))]
-    public DocumentStatus? Status { get; set; }
+    public string? Status { get; set; }
 
     [JsonPropertyName("rmStatus")]
-    [JsonConverter(typeof(JsonStringEnumConverter))]
-    public RmStatus? RmStatus { get; set; }
+    public string? RmStatus { get; set; }
 
     [JsonPropertyName("comment")]
     public string? Comment { get; set; }
@@ -239,14 +246,8 @@ public class RmDocumentUpdateDto
     [JsonPropertyName("deferralNumber")]
     public string? DeferralNumber { get; set; }
 
-    [JsonPropertyName("_id")]
-    public Guid? _id { get; set; }
-
-    [JsonPropertyName("id")]
-    public Guid? Id { get; set; }
-
-    // Helper property to get the document ID from either _id or Id
-    public Guid? DocumentId => _id ?? Id;
+    [JsonIgnore]
+    public Guid? DocumentId => Id ?? _id;
 }
 
 public class UploadSupportingDocDto
@@ -300,6 +301,9 @@ public class CoCreatorDocumentDto
 
     [JsonPropertyName("creatorStatus")]
     public string? CreatorStatus { get; set; }
+
+    [JsonPropertyName("rmStatus")]
+    public string? RmStatus { get; set; }
 
     [JsonPropertyName("checkerStatus")]
     public string? CheckerStatus { get; set; } // Frontend sends checker status from loaded data

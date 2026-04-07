@@ -1,5 +1,6 @@
 using System;
 using System.Data;
+using System.IO;
 using System.Text.Json;
 using MySqlConnector;
 
@@ -7,14 +8,22 @@ class Program
 {
     static int Main(string[] args)
     {
+        var connStr = ResolveConnectionString();
+
+        if (args.Length > 0 && string.Equals(args[0], "--list-actioned", StringComparison.OrdinalIgnoreCase))
+        {
+            return ListActioned(connStr);
+        }
+
         if (args.Length == 0)
         {
-            Console.Error.WriteLine("Usage: dotnet run -- <DEFERRAL_NUMBER>");
+            Console.Error.WriteLine("Usage: dotnet run -- <DEFERRAL_NUMBER> [deferral|approvers|documents|extensions|facilities|full]");
+            Console.Error.WriteLine("   or: dotnet run -- --list-actioned");
             return 2;
         }
+
         var defNumber = args[0];
-        var mode = args.Length > 1 ? args[1] : "deferral"; // 'deferral' or 'approvers' or 'documents' or 'full'
-        var connStr = "Server=localhost;Database=dcl_ncba;User=root;Password=password123;";
+        var mode = args.Length > 1 ? args[1] : "deferral"; // 'deferral' or 'approvers' or 'documents' or 'extensions' or 'facilities' or 'full'
 
         try
         {
@@ -130,12 +139,38 @@ class Program
                     return 0;
                 }
 
+                rDocs.Close();
+
+                using var cmdFacilities = conn.CreateCommand();
+                cmdFacilities.CommandText = "SELECT * FROM Facilities WHERE DeferralId = @id ORDER BY Id;";
+                cmdFacilities.Parameters.AddWithValue("@id", defId);
+                using var rFacilities = cmdFacilities.ExecuteReader();
+                var facilities = new System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>();
+                while (rFacilities.Read())
+                {
+                    var fd = new System.Collections.Generic.Dictionary<string, object?>();
+                    for (int k = 0; k < rFacilities.FieldCount; k++)
+                    {
+                        var n = rFacilities.GetName(k);
+                        var v = rFacilities.IsDBNull(k) ? null : rFacilities.GetValue(k);
+                        fd[n] = v;
+                    }
+                    facilities.Add(fd);
+                }
+
+                if (mode == "facilities")
+                {
+                    Console.WriteLine(JsonSerializer.Serialize(facilities, options));
+                    return 0;
+                }
+
                 // full
                 var full = new System.Collections.Generic.Dictionary<string, object?>();
                 full["deferral"] = defDict;
                 full["approvers"] = approvers;
                 full["extensions"] = extensions;
                 full["documents"] = documents;
+                full["facilities"] = facilities;
                 Console.WriteLine(JsonSerializer.Serialize(full, options));
                 return 0;
             }
@@ -144,6 +179,76 @@ class Program
         catch (Exception ex)
         {
             Console.Error.WriteLine("ERROR: " + ex.ToString());
+            return 1;
+        }
+    }
+
+    static string ResolveConnectionString()
+    {
+        var appSettingsPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "appsettings.json"));
+        if (!File.Exists(appSettingsPath))
+        {
+            return "Server=localhost;Database=ncba_dcl;User=root;Password=Skata@123;";
+        }
+
+        using var stream = File.OpenRead(appSettingsPath);
+        using var document = JsonDocument.Parse(stream);
+        if (document.RootElement.TryGetProperty("ConnectionStrings", out var connectionStrings) &&
+            connectionStrings.TryGetProperty("DefaultConnection", out var defaultConnection))
+        {
+            var value = defaultConnection.GetString();
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return value;
+            }
+        }
+
+        return "Server=localhost;Database=ncba_dcl;User=root;Password=Skata@123;";
+    }
+
+    static int ListActioned(string connStr)
+    {
+        try
+        {
+            using var conn = new MySqlConnection(connStr);
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+SELECT 
+  d.DeferralNumber,
+  d.Status,
+  d.CustomerName,
+  d.DclNumber,
+  d.CreatedAt,
+  d.UpdatedAt,
+  COUNT(DISTINCT doc.Id) AS DocumentCount,
+  COUNT(DISTINCT fac.Id) AS FacilityCount
+FROM Deferrals d
+LEFT JOIN DeferralDocuments doc ON doc.DeferralId = d.Id
+LEFT JOIN Facilities fac ON fac.DeferralId = d.Id
+WHERE d.Status IN ('Approved', 'Rejected', 'Closed', 'CloseRequested', 'CloseRequestedCreatorApproved', 'PartiallyApproved')
+GROUP BY d.Id, d.DeferralNumber, d.Status, d.CustomerName, d.DclNumber, d.CreatedAt, d.UpdatedAt
+ORDER BY d.UpdatedAt DESC
+LIMIT 20;";
+
+            using var reader = cmd.ExecuteReader();
+            var rows = new System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>();
+            while (reader.Read())
+            {
+                var row = new System.Collections.Generic.Dictionary<string, object?>();
+                for (int i = 0; i < reader.FieldCount; i++)
+                {
+                    row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                }
+                rows.Add(row);
+            }
+
+            Console.WriteLine(JsonSerializer.Serialize(rows, new JsonSerializerOptions { WriteIndented = true }));
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("ERROR: " + ex);
             return 1;
         }
     }

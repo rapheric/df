@@ -14,6 +14,7 @@ namespace NCBA.DCL.Controllers;
 [Route("api/admin/auth")]
 public class AuthController : ControllerBase
 {
+    private const int MaxPasswordAttempts = 3;
     private readonly ApplicationDbContext _context;
     private readonly JwtTokenGenerator _tokenGenerator;
     private readonly IMFAService _mfaService;
@@ -102,10 +103,51 @@ public class AuthController : ControllerBase
                 return StatusCode(403, new { message = "Account deactivated" });
             }
 
+            if (user.IsPasswordLocked)
+            {
+                return StatusCode(423, new
+                {
+                    message = "Your password has been blocked after 3 failed attempts. Contact an administrator to unlock your account.",
+                    isPasswordLocked = true
+                });
+            }
+
             if (!PasswordHasher.VerifyPassword(request.Password, user.Password))
             {
+                user.FailedLoginAttempts += 1;
+                user.UpdatedAt = DateTime.UtcNow;
+
+                var remainingAttempts = Math.Max(0, MaxPasswordAttempts - user.FailedLoginAttempts);
+                if (user.FailedLoginAttempts >= MaxPasswordAttempts)
+                {
+                    user.IsPasswordLocked = true;
+                    user.PasswordLockedAt = DateTime.UtcNow;
+                    await _mfaService.LogMFAAttemptAsync(user.Id, "PASSWORD", false, "Password locked after maximum failed attempts", GetClientIp());
+                    await _context.SaveChangesAsync();
+
+                    return StatusCode(423, new
+                    {
+                        message = "Your password has been blocked after 3 failed attempts. Contact an administrator to unlock your account.",
+                        isPasswordLocked = true
+                    });
+                }
+
                 await _mfaService.LogMFAAttemptAsync(user.Id, "PASSWORD", false, "Invalid password", GetClientIp());
-                return Unauthorized(new { message = "Invalid credentials" });
+                await _context.SaveChangesAsync();
+                return Unauthorized(new
+                {
+                    message = $"Invalid credentials. {remainingAttempts} password attempt{(remainingAttempts == 1 ? string.Empty : "s")} remaining.",
+                    remainingAttempts,
+                    isPasswordLocked = false
+                });
+            }
+
+            if (user.FailedLoginAttempts > 0 || user.IsPasswordLocked || user.PasswordLockedAt.HasValue)
+            {
+                user.FailedLoginAttempts = 0;
+                user.IsPasswordLocked = false;
+                user.PasswordLockedAt = null;
+                user.UpdatedAt = DateTime.UtcNow;
             }
 
             // ✅ NEW: Send email-based MFA code on successful password verification
@@ -119,8 +161,8 @@ public class AuthController : ControllerBase
             _logger.LogInformation($"🔒 [MFA CODE FOR TESTING] Code: {mfaCode} | Email: {user.Email}");
 
             // Add code to response header for development (visible in browser Network tab)
-            Response.Headers.Add("X-MFA-Code-Dev", mfaCode);
-            Response.Headers.Add("X-MFA-SessionToken-Dev", mfaSessionToken);
+            Response.Headers.Append("X-MFA-Code-Dev", mfaCode);
+            Response.Headers.Append("X-MFA-SessionToken-Dev", mfaSessionToken);
 
             // Store the MFA code (expires in 10 minutes)
             var emailMFARecord = new EmailMFACode
@@ -231,9 +273,18 @@ public class AuthController : ControllerBase
             mfaRecord.VerifiedAt = DateTime.UtcNow;
 
             var user = mfaRecord.User;
+            if (user == null)
+            {
+                return BadRequest(new { message = "User not found for this MFA session" });
+            }
 
             // Generate JWT token
             var token = _tokenGenerator.GenerateToken(user);
+
+            user.IsOnline = true;
+            user.LoginTime = DateTime.UtcNow;
+            user.LastSeen = DateTime.UtcNow;
+            user.UpdatedAt = DateTime.UtcNow;
 
             // Log successful login
             var log = new UserLog
@@ -319,7 +370,7 @@ public class AuthController : ControllerBase
             }
             catch (Exception emailEx)
             {
-                _logger.LogError(emailEx, $"Failed to resend MFA code to {mfaRecord.User.Email}");
+                _logger.LogError(emailEx, $"Failed to resend MFA code to {mfaRecord.User?.Email}");
             }
 
             // ✅ Also prepare SMS code resend for phone number
@@ -594,7 +645,19 @@ public class AuthController : ControllerBase
             if (!success)
                 return BadRequest(new { message });
 
+            if (user == null)
+            {
+                return BadRequest(new { message = "User not found" });
+            }
+
             var token = _tokenGenerator.GenerateToken(user);
+
+            user.IsOnline = true;
+            user.LoginTime = DateTime.UtcNow;
+            user.LastSeen = DateTime.UtcNow;
+            user.UpdatedAt = DateTime.UtcNow;
+
+            await _context.SaveChangesAsync();
 
             return Ok(new SSOCallbackResponse
             {
@@ -743,6 +806,10 @@ public class AuthController : ControllerBase
 
             if (user == null)
                 return NotFound(new { message = "User not found" });
+
+            user.IsOnline = false;
+            user.LastSeen = DateTime.UtcNow;
+            user.UpdatedAt = DateTime.UtcNow;
 
             // Immediate logout: record the action and return success.
             var userLog = new UserLog

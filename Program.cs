@@ -4,6 +4,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Net.Http.Headers;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
@@ -12,8 +13,10 @@ using NCBA.DCL.Data;
 using System.Data;
 using NCBA.DCL.Helpers;
 using NCBA.DCL.Services;
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
+var corsOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];
 
 // Add services to the container
 builder.Services.AddControllers()
@@ -71,6 +74,7 @@ builder.Services.AddAuthentication(options =>
 });
 
 builder.Services.AddAuthorization();
+builder.Services.AddMemoryCache();
 
 // Register SignalR and online user tracker
 builder.Services.AddSignalR();
@@ -84,17 +88,35 @@ builder.Services.AddScoped<IAdminService, AdminService>();
 builder.Services.AddScoped<IAuthService, AuthService>();
 builder.Services.AddScoped<IMFAService, MFAService>();
 builder.Services.AddScoped<ISSOService, SSOService>();
+builder.Services.Configure<ChatbotOptions>(builder.Configuration.GetSection("Chatbot"));
+builder.Services.AddSingleton<IChatbotService, ChatbotService>();
 builder.Services.AddHttpClient();
+builder.Services.AddHttpClient("ChatbotProxy")
+    .ConfigureHttpClient((serviceProvider, client) =>
+    {
+        var options = serviceProvider.GetRequiredService<IOptionsMonitor<ChatbotOptions>>().CurrentValue;
+        client.Timeout = TimeSpan.FromSeconds(Math.Clamp(options.RequestTimeoutSeconds, 5, 120));
+        client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+    });
 
 // Configure CORS
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
     {
-        policy.SetIsOriginAllowed(_ => true) // Allow any origin in dev
+        if (corsOrigins.Length > 0)
+        {
+            policy.WithOrigins(corsOrigins)
+                  .AllowAnyMethod()
+                  .AllowAnyHeader()
+                  .AllowCredentials();
+            return;
+        }
+
+        policy.SetIsOriginAllowed(_ => true)
               .AllowAnyMethod()
               .AllowAnyHeader()
-              .AllowCredentials(); // Required for SignalR
+              .AllowCredentials();
     });
 });
 

@@ -301,32 +301,73 @@ public class UserController : ControllerBase
     }
 
     [HttpGet("online")]
-    public IActionResult GetOnlineUsers()
+    public async Task<IActionResult> GetOnlineUsers()
     {
         try
         {
-            var onlineUsers = _onlineUserTracker.GetAll()
+            var threshold = DateTime.UtcNow.AddMinutes(-10);
+
+            var onlineUsers = await _context.Users
+                .Where(u => u.Active && u.IsOnline && u.LastSeen >= threshold)
                 .Select(u => new
                 {
                     _id = u.Id,
                     name = u.Name,
                     email = u.Email,
-                    role = u.Role,
+                    customerNumber = u.CustomerNumber,
+                    role = u.Role.ToString(),
                     lastSeen = u.LastSeen,
                     loginTime = u.LoginTime,
-                    currentPage = u.CurrentPage,
-                    ipAddress = u.IpAddress,
-                    userAgent = u.UserAgent,
-                    socketCount = u.SocketIds.Count
+                    socketCount = 1,
+                    status = "Active in last 10m"
                 })
                 .OrderBy(u => u.name)
-                .ToList();
+                .ToListAsync();
 
             return Ok(new { success = true, count = onlineUsers.Count, users = onlineUsers });
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            _logger.LogError(ex, "Failed to fetch online users");
             return StatusCode(500, new { success = false, message = "Failed to fetch online users" });
+        }
+    }
+
+    [HttpPost("presence/heartbeat")]
+    public async Task<IActionResult> Heartbeat()
+    {
+        try
+        {
+            var userIdClaim = User.FindFirst("id")?.Value;
+            if (!Guid.TryParse(userIdClaim, out var userId))
+            {
+                return Unauthorized(new { success = false, message = "Invalid user session" });
+            }
+
+            var user = await _context.Users.FindAsync(userId);
+            if (user == null)
+            {
+                return NotFound(new { success = false, message = "User not found" });
+            }
+
+            user.IsOnline = true;
+            user.LastSeen = DateTime.UtcNow;
+            user.LoginTime ??= DateTime.UtcNow;
+            user.UpdatedAt = DateTime.UtcNow;
+
+            await _context.SaveChangesAsync();
+
+            return Ok(new
+            {
+                success = true,
+                lastSeen = user.LastSeen,
+                loginTime = user.LoginTime,
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to update user heartbeat");
+            return StatusCode(500, new { success = false, message = "Failed to update heartbeat" });
         }
     }
 
@@ -499,6 +540,7 @@ public class UserController : ControllerBase
                .Take(200)
                .Select(l => new
                {
+                   id = l.Id,
                    date = l.CreatedAt,
                    action = l.Action,
                    details = (string?)l.Details,
@@ -506,7 +548,24 @@ public class UserController : ControllerBase
                    performedBy = l.PerformedBy != null ? l.PerformedBy.Name : "System",
                    target = l.TargetUser != null ? l.TargetUser.Name : (l.Resource != null ? $"Resource: {l.Resource}" : "N/A"),
                    resource = (string?)l.Resource,
+                   resourceId = l.ResourceId,
                    type = "audit"
+               })
+               .ToListAsync();
+
+            var checklistLogs = await _context.ChecklistLogs
+               .Where(l => l.UserId == id)
+               .OrderByDescending(l => l.Timestamp)
+               .Take(200)
+               .Select(l => new
+               {
+                   id = l.Id,
+                   date = l.Timestamp,
+                   message = l.Message,
+                   checklistId = l.ChecklistId,
+                   checklistNumber = l.Checklist.DclNo,
+                   customerName = l.Checklist.CustomerName,
+                   type = "workflow"
                })
                .ToListAsync();
 
@@ -516,9 +575,10 @@ public class UserController : ControllerBase
                .Take(50)
                .Select(l => new
                {
+                   id = l.Id,
                    date = l.Timestamp,
                    action = l.Action,
-                   details = (string?)l.Action,
+                   details = (string?)null,
                    status = "success",
                    performedBy = l.PerformedBy != null ? l.PerformedBy.Name : (l.PerformedByEmail ?? "System"),
                    target = l.TargetUser != null ? l.TargetUser.Name : (l.TargetEmail ?? "N/A"),
@@ -527,10 +587,57 @@ public class UserController : ControllerBase
                })
                .ToListAsync();
 
-            // Combine and sort in memory
             var allActivities = auditLogs
-                .Concat(userLogs)
-                .OrderByDescending(x => x.date)
+                .Select(log => new UserActivityItem
+                {
+                    Id = log.id,
+                    Date = log.date,
+                    Action = log.action,
+                    ActionLabel = HumanizeAction(log.action),
+                    Summary = BuildAuditSummary(log.action, log.details, log.resource, log.target, log.status),
+                    Details = log.details,
+                    Status = log.status,
+                    PerformedBy = log.performedBy,
+                    Target = log.target,
+                    Resource = BuildResourceLabel(log.resource, log.resourceId),
+                    Type = log.type,
+                    Source = "Audit Log"
+                })
+                .Concat(checklistLogs.Select(log => new UserActivityItem
+                {
+                    Id = log.id,
+                    Date = log.date,
+                    Action = "CHECKLIST_ACTIVITY",
+                    ActionLabel = "Workflow Activity",
+                    Summary = string.IsNullOrWhiteSpace(log.message)
+                        ? $"Worked on DCL {log.checklistNumber}"
+                        : log.message!,
+                    Details = string.IsNullOrWhiteSpace(log.customerName)
+                        ? $"DCL {log.checklistNumber}"
+                        : $"DCL {log.checklistNumber} for {log.customerName}",
+                    Status = "success",
+                    PerformedBy = "Workflow User",
+                    Target = log.customerName ?? log.checklistNumber ?? "Checklist",
+                    Resource = $"Checklist {log.checklistNumber}",
+                    Type = log.type,
+                    Source = "Checklist Log"
+                }))
+                .Concat(userLogs.Select(log => new UserActivityItem
+                {
+                    Id = log.id,
+                    Date = log.date,
+                    Action = log.action,
+                    ActionLabel = HumanizeAction(log.action),
+                    Summary = BuildUserLogSummary(log.action, log.target),
+                    Details = log.details,
+                    Status = log.status,
+                    PerformedBy = log.performedBy,
+                    Target = log.target,
+                    Resource = log.resource,
+                    Type = log.type,
+                    Source = "Access Log"
+                }))
+                .OrderByDescending(x => x.Date)
                 .Take(200)
                 .ToList();
 
@@ -570,6 +677,80 @@ public class UserController : ControllerBase
     {
         var result = await _adminService.TransferRoleAsync(id.ToString(), dto);
         return StatusCode(result.StatusCode, result.Body);
+    }
+    private sealed class UserActivityItem
+    {
+        public Guid Id { get; set; }
+        public DateTime Date { get; set; }
+        public string Action { get; set; } = string.Empty;
+        public string ActionLabel { get; set; } = string.Empty;
+        public string Summary { get; set; } = string.Empty;
+        public string? Details { get; set; }
+        public string Status { get; set; } = "success";
+        public string? PerformedBy { get; set; }
+        public string? Target { get; set; }
+        public string? Resource { get; set; }
+        public string Type { get; set; } = string.Empty;
+        public string Source { get; set; } = string.Empty;
+    }
+
+    private static string HumanizeAction(string? action)
+    {
+        return action switch
+        {
+            "LOGIN" => "Signed In",
+            "LOGOUT" => "Signed Out",
+            "CREATE_USER" => "Created User",
+            "TOGGLE_ACTIVE" => "Changed Account Status",
+            "CHANGE_ROLE" => "Changed Role",
+            "REASSIGN_TASKS" => "Reassigned Tasks",
+            "CHECKLIST_ACTIVITY" => "Workflow Activity",
+            _ when string.IsNullOrWhiteSpace(action) => "Activity",
+            _ => action.Replace("_", " ").Trim()
+        };
+    }
+
+    private static string BuildAuditSummary(string? action, string? details, string? resource, string? target, string? status)
+    {
+        if (!string.IsNullOrWhiteSpace(details))
+        {
+            return details!;
+        }
+
+        var label = HumanizeAction(action);
+        var resourceLabel = string.IsNullOrWhiteSpace(resource) ? "item" : resource!.ToLowerInvariant();
+        var targetLabel = string.IsNullOrWhiteSpace(target) || target == "N/A" ? string.Empty : $" for {target}";
+        var statusLabel = string.IsNullOrWhiteSpace(status) ? string.Empty : $" ({status})";
+        return $"{label} on {resourceLabel}{targetLabel}{statusLabel}".Trim();
+    }
+
+    private static string BuildUserLogSummary(string? action, string? target)
+    {
+        return action switch
+        {
+            "LOGIN" => "Signed into the system",
+            "LOGOUT" => "Signed out of the system",
+            "CREATE_USER" => $"Created user account for {target}",
+            "TOGGLE_ACTIVE" => $"Changed account status for {target}",
+            "CHANGE_ROLE" => $"Changed role assignment for {target}",
+            "REASSIGN_TASKS" => $"Reassigned tasks for {target}",
+            _ => HumanizeAction(action)
+        };
+    }
+
+    private static string? BuildResourceLabel(string? resource, string? resourceId)
+    {
+        if (string.IsNullOrWhiteSpace(resource) && string.IsNullOrWhiteSpace(resourceId))
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(resourceId))
+        {
+            return resource;
+        }
+
+        return $"{resource} {resourceId}";
     }
 }
 

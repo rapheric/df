@@ -7,6 +7,44 @@ namespace NCBA.DCL.Data
 {
     public static class DbInitializer
     {
+        private static bool IsSafeSqlIdentifier(string identifier)
+        {
+            return !string.IsNullOrWhiteSpace(identifier)
+                && identifier.All(ch => char.IsLetterOrDigit(ch) || ch == '_');
+        }
+
+        private static async Task EnsureColumnExistsAsync(
+            ApplicationDbContext context,
+            string tableName,
+            string columnName,
+            string columnDefinition)
+        {
+            if (!IsSafeSqlIdentifier(tableName) || !IsSafeSqlIdentifier(columnName))
+            {
+                throw new InvalidOperationException("Unsafe SQL identifier detected during schema initialization.");
+            }
+
+            var exists = await context.Database.SqlQueryRaw<int>($@"
+                SELECT COUNT(*) AS Value
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = {{0}}
+                  AND COLUMN_NAME = {{1}}",
+                tableName,
+                columnName)
+                .SingleAsync();
+
+            if (exists > 0)
+            {
+                return;
+            }
+
+#pragma warning disable EF1002
+            await context.Database.ExecuteSqlRawAsync(
+                $"ALTER TABLE `{tableName}` ADD COLUMN `{columnName}` {columnDefinition}");
+#pragma warning restore EF1002
+        }
+
         public static async Task SeedData(ApplicationDbContext context)
         {
             try
@@ -34,66 +72,15 @@ namespace NCBA.DCL.Data
                 // Ensure missing columns exist (as a fallback for migration issues)
                 try
                 {
-                    // Add NextDueDate to Deferrals
-                    try
-                    {
-                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE Deferrals ADD COLUMN NextDueDate datetime(6) NULL");
-                    }
-                    catch { /* Column already exists */ }
-
-                    // Add NextDocumentDueDate to Deferrals
-                    try
-                    {
-                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE Deferrals ADD COLUMN NextDocumentDueDate datetime(6) NULL");
-                    }
-                    catch { /* Column already exists */ }
-
-                    // Add SlaExpiry to Deferrals
-                    try
-                    {
-                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE Deferrals ADD COLUMN SlaExpiry datetime(6) NULL");
-                    }
-                    catch { /* Column already exists */ }
-
-                    // Add date columns to Extensions
-                    try
-                    {
-                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE Extensions ADD COLUMN NextDueDate datetime(6) NULL");
-                    }
-                    catch { /* Column already exists */ }
-
-                    try
-                    {
-                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE Extensions ADD COLUMN NextDocumentDueDate datetime(6) NULL");
-                    }
-                    catch { /* Column already exists */ }
-
-                    try
-                    {
-                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE Extensions ADD COLUMN SlaExpiry datetime(6) NULL");
-                    }
-                    catch { /* Column already exists */ }
-
-                    // Add missing DaysSought column to Deferrals (safeguard for older schemas)
-                    try
-                    {
-                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE Deferrals ADD COLUMN DaysSought int NOT NULL DEFAULT 0");
-                    }
-                    catch { /* Column already exists or cannot be added */ }
-
-                    // Add missing DaysSought column to DeferralDocuments (per-document metadata)
-                    try
-                    {
-                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE DeferralDocuments ADD COLUMN DaysSought int NULL");
-                    }
-                    catch { /* Column already exists or cannot be added */ }
-
-                    // Add NextDocumentDueDate to DeferralDocuments (per-document metadata)
-                    try
-                    {
-                        await context.Database.ExecuteSqlRawAsync("ALTER TABLE DeferralDocuments ADD COLUMN NextDocumentDueDate datetime(6) NULL");
-                    }
-                    catch { /* Column already exists or cannot be added */ }
+                    await EnsureColumnExistsAsync(context, "Deferrals", "NextDueDate", "datetime(6) NULL");
+                    await EnsureColumnExistsAsync(context, "Deferrals", "NextDocumentDueDate", "datetime(6) NULL");
+                    await EnsureColumnExistsAsync(context, "Deferrals", "SlaExpiry", "datetime(6) NULL");
+                    await EnsureColumnExistsAsync(context, "Extensions", "NextDueDate", "datetime(6) NULL");
+                    await EnsureColumnExistsAsync(context, "Extensions", "NextDocumentDueDate", "datetime(6) NULL");
+                    await EnsureColumnExistsAsync(context, "Extensions", "SlaExpiry", "datetime(6) NULL");
+                    await EnsureColumnExistsAsync(context, "Deferrals", "DaysSought", "int NOT NULL DEFAULT 0");
+                    await EnsureColumnExistsAsync(context, "DeferralDocuments", "DaysSought", "int NULL");
+                    await EnsureColumnExistsAsync(context, "DeferralDocuments", "NextDocumentDueDate", "datetime(6) NULL");
 
                     Console.WriteLine("✅ Database schema columns verified");
                 }

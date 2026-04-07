@@ -16,7 +16,7 @@ namespace NCBA.DCL.Migrations
     partial class AddApproverRejectedReturned
     {
         /// <inheritdoc />
-        protected void BuildTargetModel(ModelBuilder modelBuilder)
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder

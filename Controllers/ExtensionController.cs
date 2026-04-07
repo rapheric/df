@@ -139,7 +139,9 @@ public class ExtensionController : ControllerBase
                 {
                     foreach (var sd in persisted)
                     {
-                        var name = (sd?.Name ?? sd?.Type ?? string.Empty).Trim();
+                        if (sd == null) continue;
+
+                        var name = (sd.Name ?? sd.Type ?? string.Empty).Trim();
                         if (string.IsNullOrWhiteSpace(name)) continue;
                         var key = name.ToLowerInvariant().Trim();
                         extDays.TryGetValue(key, out var addDays);
@@ -948,7 +950,7 @@ public class ExtensionController : ControllerBase
                 options
             ) ?? new List<SelectedDocumentData>();
         }
-        catch (Exception ex)
+        catch (Exception)
         {
             // If deserialization fails, return empty list
             deferral.SelectedDocuments = new List<SelectedDocumentData>();

@@ -5,6 +5,7 @@ using NCBA.DCL.Data;
 using NCBA.DCL.DTOs;
 using NCBA.DCL.Middleware;
 using NCBA.DCL.Models;
+using NCBA.DCL.Services;
 
 namespace NCBA.DCL.Controllers;
 
@@ -15,11 +16,13 @@ public class RMController : ControllerBase
 {
     private readonly ApplicationDbContext _context;
     private readonly ILogger<RMController> _logger;
+    private readonly IEmailService _emailService;
 
-    public RMController(ApplicationDbContext context, ILogger<RMController> logger)
+    public RMController(ApplicationDbContext context, ILogger<RMController> logger, IEmailService emailService)
     {
         _context = context;
         _logger = logger;
+        _emailService = emailService;
     }
 
     // DELETE /api/rmChecklist/:id
@@ -83,8 +86,13 @@ public class RMController : ControllerBase
                 .Include(c => c.Documents)
                     .ThenInclude(dc => dc.DocList)
                 .Include(c => c.SupportingDocs)
+                    .ThenInclude(sd => sd.UploadedBy)
                 .OrderByDescending(c => c.CreatedAt)
-                .Select(c => new
+                .ToListAsync();
+
+            var uploadLookup = await GetLatestDocumentUploadsLookupAsync(checklists.Select(c => c.Id));
+
+            var response = checklists.Select(c => new
                 {
                     id = c.Id,
                     dclNo = c.DclNo,
@@ -99,15 +107,22 @@ public class RMController : ControllerBase
                     {
                         id = dc.Id,
                         category = dc.Category,
-                        docList = dc.DocList.Select(d => new
+                        docList = dc.DocList.Select(d =>
                         {
-                            id = d.Id,
-                            name = d.Name,
-                            status = d.Status.ToString().ToLower(),
-                            rmStatus = d.RmStatus.ToString().ToLower(),
-                            fileUrl = d.FileUrl,
-                            comment = d.Comment,
-                            deferralNumber = d.DeferralNumber
+                            var upload = GetLatestDocumentUpload(uploadLookup, c.Id, d.Id);
+                            return new
+                            {
+                                id = d.Id,
+                                name = d.Name,
+                                status = d.Status.ToString().ToLower(),
+                                rmStatus = d.RmStatus.ToString().ToLower(),
+                                fileUrl = d.FileUrl,
+                                comment = d.Comment,
+                                deferralNumber = d.DeferralNumber,
+                                uploadedAt = BuildDocumentUploadedAt(d, upload, c.AssignedToRM),
+                                uploadedBy = BuildDocumentUploader(upload, d, c.AssignedToRM),
+                                uploadedByRole = BuildDocumentUploaderRole(upload, d, c.AssignedToRM)
+                            };
                         }).ToList()
                     }).ToList(),
                     supportingDocs = c.SupportingDocs.Select(sd => new
@@ -117,6 +132,7 @@ public class RMController : ControllerBase
                         fileUrl = sd.FileUrl,
                         fileSize = sd.FileSize,
                         fileType = sd.FileType,
+                        uploadedBy = sd.UploadedBy != null ? sd.UploadedBy.Name : null,
                         uploadedById = sd.UploadedById,
                         uploadedByRole = sd.UploadedByRole,
                         uploadedAt = sd.UploadedAt
@@ -124,11 +140,11 @@ public class RMController : ControllerBase
                     createdAt = c.CreatedAt,
                     updatedAt = c.UpdatedAt
                 })
-                .ToListAsync();
+                .ToList();
 
-            _logger.LogInformation($"🔥 Fetched RM Queue Count: {checklists.Count}");
+            _logger.LogInformation($"🔥 Fetched RM Queue Count: {response.Count}");
 
-            return Ok(checklists);
+            return Ok(response);
         }
         catch (Exception ex)
         {
@@ -157,6 +173,7 @@ public class RMController : ControllerBase
 
             var checklist = await _context.Checklists
                 .Include(c => c.CreatedBy)
+                .Include(c => c.AssignedToRM)
                 .Include(c => c.Documents)
                     .ThenInclude(cat => cat.DocList)
                 .FirstOrDefaultAsync(c => c.Id == request.ChecklistId.Value);
@@ -165,6 +182,9 @@ public class RMController : ControllerBase
             {
                 return NotFound(new { error = "Checklist not found" });
             }
+
+            var userName = User.FindFirst("name")?.Value ?? checklist.AssignedToRM?.Name ?? "RM";
+            var userRole = User.FindFirst("role")?.Value ?? "RM";
 
             _logger.LogInformation($"📋 RM Submission - Checklist {checklist.DclNo} loaded with {checklist.Documents.Count} document categories");
 
@@ -208,14 +228,16 @@ public class RMController : ControllerBase
                     docsUpdated++;
 
                     // Only RM fields
-                    if (updatedDoc.Status.HasValue)
+                    var parsedDocumentStatus = TryParseDocumentStatus(updatedDoc.Status);
+                    if (parsedDocumentStatus.HasValue)
                     {
-                        doc.Status = updatedDoc.Status.Value;
+                        doc.Status = parsedDocumentStatus.Value;
                     }
 
-                    if (updatedDoc.RmStatus.HasValue)
+                    var parsedRmStatus = TryParseRmStatus(updatedDoc.RmStatus);
+                    if (parsedRmStatus.HasValue)
                     {
-                        doc.RmStatus = updatedDoc.RmStatus.Value;
+                        doc.RmStatus = parsedRmStatus.Value;
                     }
 
                     if (!string.IsNullOrEmpty(updatedDoc.Comment))
@@ -226,6 +248,43 @@ public class RMController : ControllerBase
                     if (!string.IsNullOrEmpty(updatedDoc.FileUrl))
                     {
                         doc.FileUrl = updatedDoc.FileUrl;
+
+                        var timestamp = DateTime.UtcNow;
+                        var existingUpload = await _context.Uploads
+                            .Where(u => u.ChecklistId == request.ChecklistId.Value && u.DocumentId == updatedDoc.DocumentId.Value)
+                            .OrderByDescending(u => u.CreatedAt)
+                            .FirstOrDefaultAsync();
+
+                        if (existingUpload == null)
+                        {
+                            _context.Uploads.Add(new Upload
+                            {
+                                Id = Guid.NewGuid(),
+                                ChecklistId = request.ChecklistId.Value,
+                                DocumentId = updatedDoc.DocumentId.Value,
+                                DocumentName = doc.Name,
+                                Category = updatedDoc.Category,
+                                FileName = ExtractFileNameFromUrl(updatedDoc.FileUrl) ?? doc.Name,
+                                FileUrl = updatedDoc.FileUrl,
+                                UploadedBy = userName,
+                                UploadedByRole = userRole,
+                                Status = "active",
+                                CreatedAt = timestamp,
+                                UpdatedAt = timestamp
+                            });
+                        }
+                        else
+                        {
+                            existingUpload.DocumentName = doc.Name;
+                            existingUpload.Category = updatedDoc.Category;
+                            existingUpload.FileName = ExtractFileNameFromUrl(updatedDoc.FileUrl) ?? doc.Name;
+                            existingUpload.FileUrl = updatedDoc.FileUrl;
+                            existingUpload.UploadedBy = userName;
+                            existingUpload.UploadedByRole = userRole;
+                            existingUpload.Status = "active";
+                            existingUpload.CreatedAt = timestamp;
+                            existingUpload.UpdatedAt = timestamp;
+                        }
                     }
 
                     if (!string.IsNullOrEmpty(updatedDoc.DeferralReason))
@@ -340,6 +399,28 @@ public class RMController : ControllerBase
 
             await _context.SaveChangesAsync();
 
+            try
+            {
+                if (checklist.CreatedBy != null && !string.IsNullOrWhiteSpace(checklist.CreatedBy.Email))
+                {
+                    var submittedByName = User.FindFirst("name")?.Value ?? User.Identity?.Name ?? "RM";
+                    var emailSent = await _emailService.SendDclReturnedToCoCreatorAsync(
+                        checklist.CreatedBy.Email,
+                        checklist.CreatedBy.Name,
+                        checklist.DclNo,
+                        submittedByName);
+
+                    if (!emailSent)
+                    {
+                        _logger.LogWarning("⚠️ RM submitted checklist back to Co-Creator but email service reported no delivery for {DclNo}", checklist.DclNo);
+                    }
+                }
+            }
+            catch (Exception emailEx)
+            {
+                _logger.LogWarning(emailEx, "⚠️ RM submitted checklist back to Co-Creator but email delivery failed for {DclNo}", checklist.DclNo);
+            }
+
             _logger.LogInformation($"✅ RM submitted checklist {checklist.DclNo} to Co-Creator");
 
             return Ok(new
@@ -393,6 +474,7 @@ public class RMController : ControllerBase
 
             // Fetch supporting documents from both Uploads and SupportingDocs tables
             var supportingDocs = await CombineSupportingDocsWithUploadsAsync(id, checklist);
+            var uploadLookup = await GetLatestDocumentUploadsLookupAsync(new[] { id });
 
             return Ok(new
             {
@@ -411,22 +493,29 @@ public class RMController : ControllerBase
                 {
                     id = dc.Id,
                     category = dc.Category,
-                    docList = dc.DocList.Select(d => new
+                    docList = dc.DocList.Select(d =>
                     {
-                        id = d.Id,
-                        name = d.Name,
-                        status = d.Status.ToString().ToLower(),
-                        fileUrl = d.FileUrl,
-                        comment = d.Comment,
-                        deferralReason = d.DeferralReason,
-                        deferralNumber = d.DeferralNumber,
-                        rmStatus = d.RmStatus.ToString().ToLower(),
-                        coCreatorFiles = d.CoCreatorFiles.Select(cf => new
+                        var upload = GetLatestDocumentUpload(uploadLookup, id, d.Id);
+                        return new
                         {
-                            id = cf.Id,
-                            url = cf.Url,
-                            name = cf.Name
-                        }).ToList()
+                            id = d.Id,
+                            name = d.Name,
+                            status = d.Status.ToString().ToLower(),
+                            fileUrl = d.FileUrl,
+                            comment = d.Comment,
+                            deferralReason = d.DeferralReason,
+                            deferralNumber = d.DeferralNumber,
+                            rmStatus = d.RmStatus.ToString().ToLower(),
+                            uploadedAt = BuildDocumentUploadedAt(d, upload, checklist.AssignedToRM),
+                            uploadedBy = BuildDocumentUploader(upload, d, checklist.AssignedToRM),
+                            uploadedByRole = BuildDocumentUploaderRole(upload, d, checklist.AssignedToRM),
+                            coCreatorFiles = d.CoCreatorFiles.Select(cf => new
+                            {
+                                id = cf.Id,
+                                url = cf.Url,
+                                name = cf.Name
+                            }).ToList()
+                        };
                     }).ToList()
                 }).ToList(),
                 supportingDocs = supportingDocs,  // Use combined results from both tables
@@ -515,6 +604,115 @@ public class RMController : ControllerBase
         _logger.LogInformation($"📎 RM Controller - Total supporting docs to return: {combinedDocs.Count}");
 
         return combinedDocs;
+    }
+
+    private async Task<Dictionary<Guid, Dictionary<Guid, Upload>>> GetLatestDocumentUploadsLookupAsync(IEnumerable<Guid> checklistIds)
+    {
+        var checklistIdList = checklistIds
+            .Where(id => id != Guid.Empty)
+            .Distinct()
+            .ToList();
+
+        if (checklistIdList.Count == 0)
+        {
+            return new Dictionary<Guid, Dictionary<Guid, Upload>>();
+        }
+
+        var uploads = await _context.Uploads
+            .Where(u =>
+                u.ChecklistId.HasValue &&
+                checklistIdList.Contains(u.ChecklistId.Value) &&
+                u.DocumentId.HasValue &&
+                u.Category != "Supporting Documents" &&
+                (u.Status == null || u.Status != "deleted"))
+            .OrderByDescending(u => u.CreatedAt)
+            .ToListAsync();
+
+        return uploads
+            .GroupBy(u => u.ChecklistId!.Value)
+            .ToDictionary(
+                checklistGroup => checklistGroup.Key,
+                checklistGroup => checklistGroup
+                    .GroupBy(u => u.DocumentId!.Value)
+                    .ToDictionary(documentGroup => documentGroup.Key, documentGroup => documentGroup.First()));
+    }
+
+    private static Upload? GetLatestDocumentUpload(
+        IReadOnlyDictionary<Guid, Dictionary<Guid, Upload>> uploadLookup,
+        Guid checklistId,
+        Guid documentId)
+    {
+        if (uploadLookup.TryGetValue(checklistId, out var checklistUploads) &&
+            checklistUploads.TryGetValue(documentId, out var upload))
+        {
+            return upload;
+        }
+
+        return null;
+    }
+
+    private static object? BuildDocumentUploader(Upload? upload, Document document, User? assignedToRm)
+    {
+        if (!string.IsNullOrWhiteSpace(upload?.UploadedBy))
+        {
+            return new { id = (Guid?)null, name = upload.UploadedBy };
+        }
+
+        if (ShouldUseRmUploadFallback(document, assignedToRm))
+        {
+            return new { id = assignedToRm!.Id, name = assignedToRm.Name };
+        }
+
+        return null;
+    }
+
+    private static string? BuildDocumentUploaderRole(Upload? upload, Document document, User? assignedToRm)
+    {
+        if (!string.IsNullOrWhiteSpace(upload?.UploadedByRole))
+        {
+            return upload.UploadedByRole;
+        }
+
+        if (ShouldUseRmUploadFallback(document, assignedToRm))
+        {
+            return "RM";
+        }
+
+        return null;
+    }
+
+    private static DateTime? BuildDocumentUploadedAt(Document document, Upload? upload, User? assignedToRm)
+    {
+        if (upload != null)
+        {
+            return upload.CreatedAt;
+        }
+
+        if (ShouldUseRmUploadFallback(document, assignedToRm))
+        {
+            return document.UpdatedAt > document.CreatedAt ? document.UpdatedAt : document.CreatedAt;
+        }
+
+        return null;
+    }
+
+    private static bool ShouldUseRmUploadFallback(Document document, User? assignedToRm)
+    {
+        return assignedToRm != null &&
+               !string.IsNullOrWhiteSpace(document.FileUrl) &&
+               document.UpdatedAt > document.CreatedAt;
+    }
+
+    private static string? ExtractFileNameFromUrl(string? fileUrl)
+    {
+        if (string.IsNullOrWhiteSpace(fileUrl))
+        {
+            return null;
+        }
+
+        var normalizedUrl = fileUrl.Split('?', '#')[0];
+        var segments = normalizedUrl.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return segments.Length > 0 ? segments[^1] : null;
     }
 
     // DELETE /api/rmChecklist/:checklistId/document/:documentId
