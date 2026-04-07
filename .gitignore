@@ -387,6 +387,7 @@ FodyWeavers.xsd
 uploads/*
 !uploads/.gitkeep
 appsettings.Development.json
+appsettings.json
 appsettings.Production.json
 *.db
 *.db-shm
