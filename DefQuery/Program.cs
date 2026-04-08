@@ -185,25 +185,44 @@ class Program
 
     static string ResolveConnectionString()
     {
-        var appSettingsPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "appsettings.json"));
-        if (!File.Exists(appSettingsPath))
+        var envConnectionString =
+            Environment.GetEnvironmentVariable("ConnectionStrings__DefaultConnection")
+            ?? Environment.GetEnvironmentVariable("DEFAULT_CONNECTION");
+
+        if (!string.IsNullOrWhiteSpace(envConnectionString))
         {
-            return "Server=localhost;Database=ncba_dcl;User=root;Password=Skata@123;";
+            return envConnectionString;
         }
 
-        using var stream = File.OpenRead(appSettingsPath);
-        using var document = JsonDocument.Parse(stream);
-        if (document.RootElement.TryGetProperty("ConnectionStrings", out var connectionStrings) &&
-            connectionStrings.TryGetProperty("DefaultConnection", out var defaultConnection))
+        var configPaths = new[]
         {
-            var value = defaultConnection.GetString();
-            if (!string.IsNullOrWhiteSpace(value))
+            Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "appsettings.Development.json")),
+            Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "appsettings.json"))
+        };
+
+        foreach (var configPath in configPaths)
+        {
+            if (!File.Exists(configPath))
             {
-                return value;
+                continue;
+            }
+
+            using var stream = File.OpenRead(configPath);
+            using var document = JsonDocument.Parse(stream);
+            if (document.RootElement.TryGetProperty("ConnectionStrings", out var connectionStrings) &&
+                connectionStrings.TryGetProperty("DefaultConnection", out var defaultConnection))
+            {
+                var value = defaultConnection.GetString();
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    return value;
+                }
             }
         }
 
-        return "Server=localhost;Database=ncba_dcl;User=root;Password=Skata@123;";
+        throw new InvalidOperationException(
+            "Default database connection is not configured. Set ConnectionStrings__DefaultConnection or DEFAULT_CONNECTION."
+        );
     }
 
     static int ListActioned(string connStr)

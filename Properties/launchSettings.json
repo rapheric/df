@@ -20,9 +20,9 @@
         "SMTP_HOST": "smtp.gmail.com",
         "SMTP_PORT": "587",
         "SMTP_SECURE": "true",
-        "SMTP_USER": "onyie22@gmail.com",
-        "SMTP_PASS": "ebxilvleourudbhu",
-        "EMAIL_FROM": "onyie22@gmail.com"
+        "SMTP_USER": "",
+        "SMTP_PASS": "",
+        "EMAIL_FROM": ""
       }
     },
     "https": {
@@ -36,9 +36,9 @@
         "SMTP_HOST": "smtp.gmail.com",
         "SMTP_PORT": "587",
         "SMTP_SECURE": "true",
-        "SMTP_USER": "onyie22@gmail.com",
-        "SMTP_PASS": "ebxilvleourudbhu",
-        "EMAIL_FROM": "onyie22@gmail.com"
+        "SMTP_USER": "",
+        "SMTP_PASS": "",
+        "EMAIL_FROM": ""
       }
     },
     "IIS Express": {
@@ -50,9 +50,9 @@
         "SMTP_HOST": "smtp.gmail.com",
         "SMTP_PORT": "587",
         "SMTP_SECURE": "true",
-        "SMTP_USER": "onyie22@gmail.com",
-        "SMTP_PASS": "ebxilvleourudbhu",
-        "EMAIL_FROM": "onyie22@gmail.com"
+        "SMTP_USER": "",
+        "SMTP_PASS": "",
+        "EMAIL_FROM": ""
       }
     }
   }

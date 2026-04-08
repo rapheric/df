@@ -190,6 +190,7 @@ public class CoCreatorController : ControllerBase
             var userId = Guid.Parse(User.FindFirst("id")?.Value ?? string.Empty);
             var original = await _context.Checklists
                 .Include(c => c.Documents).ThenInclude(dc => dc.DocList)
+                .Include(c => c.SupportingDocs)
                 .FirstOrDefaultAsync(c => c.Id == id);
             if (original == null)
                 return NotFound(new { message = "Checklist not found" });
@@ -210,6 +211,53 @@ public class CoCreatorController : ControllerBase
             }
             var newDclNo = $"{baseDclNo} copy {copyNumber}";
 
+            var originalUploads = await _context.Uploads
+                .Where(u => u.ChecklistId == original.Id && (u.Status == null || u.Status != "deleted"))
+                .ToListAsync();
+
+            var revivedDocumentIdMap = new Dictionary<Guid, Guid>();
+            var revivedCategories = new List<DocumentCategory>();
+
+            foreach (var originalCategory in original.Documents)
+            {
+                var revivedCategory = new DocumentCategory
+                {
+                    Id = Guid.NewGuid(),
+                    Category = originalCategory.Category,
+                    ChecklistId = Guid.Empty,
+                    DocList = new List<Document>()
+                };
+
+                foreach (var originalDoc in originalCategory.DocList)
+                {
+                    var revivedDoc = new Document
+                    {
+                        Id = Guid.NewGuid(),
+                        Name = originalDoc.Name,
+                        Category = originalDoc.Category,
+                        Status = originalDoc.Status,
+                        FileUrl = originalDoc.FileUrl,
+                        ExpiryDate = originalDoc.ExpiryDate,
+                        Comment = originalDoc.Comment,
+                        CreatorComment = originalDoc.CreatorComment,
+                        CheckerComment = originalDoc.CheckerComment,
+                        RmComment = originalDoc.RmComment,
+                        CreatorStatus = originalDoc.CreatorStatus,
+                        CheckerStatus = originalDoc.CheckerStatus,
+                        RmStatus = originalDoc.RmStatus,
+                        DeferralReason = originalDoc.DeferralReason,
+                        DeferralNumber = originalDoc.DeferralNumber,
+                        CreatedAt = originalDoc.CreatedAt,
+                        UpdatedAt = originalDoc.UpdatedAt,
+                    };
+
+                    revivedCategory.DocList.Add(revivedDoc);
+                    revivedDocumentIdMap[originalDoc.Id] = revivedDoc.Id;
+                }
+
+                revivedCategories.Add(revivedCategory);
+            }
+
             // Clone checklist and documents
             var revived = new Checklist
             {
@@ -224,27 +272,18 @@ public class CoCreatorController : ControllerBase
                 Status = ChecklistStatus.CoCreatorReview,
                 CreatedAt = DateTime.UtcNow,
                 UpdatedAt = DateTime.UtcNow,
-                Documents = original.Documents.Select(cat => new DocumentCategory
+                Documents = revivedCategories,
+                SupportingDocs = original.SupportingDocs.Select(sd => new SupportingDoc
                 {
                     Id = Guid.NewGuid(),
-                    Category = cat.Category,
-                    ChecklistId = cat.ChecklistId,
-                    DocList = cat.DocList.Select(doc => new Document
-                    {
-                        Id = Guid.NewGuid(),
-                        Name = doc.Name,
-                        Status = doc.Status,
-                        FileUrl = doc.FileUrl,
-                        ExpiryDate = doc.ExpiryDate,
-                        Comment = doc.Comment,
-                        DeferralReason = doc.DeferralReason,
-                        DeferralNumber = doc.DeferralNumber,
-                        CheckerStatus = doc.CheckerStatus,
-
-                        RmStatus = doc.RmStatus,
-                        CreatedAt = DateTime.UtcNow,
-                        UpdatedAt = DateTime.UtcNow
-                    }).ToList()
+                    FileName = sd.FileName,
+                    FileUrl = sd.FileUrl,
+                    FileSize = sd.FileSize,
+                    FileType = sd.FileType,
+                    UploadedById = sd.UploadedById,
+                    UploadedByRole = sd.UploadedByRole,
+                    UploadedAt = sd.UploadedAt,
+                    ChecklistId = Guid.Empty,
                 }).ToList(),
                 Logs = new List<ChecklistLog> {
                         new ChecklistLog {
@@ -255,7 +294,44 @@ public class CoCreatorController : ControllerBase
                         }
                     }
             };
+
+            foreach (var revivedCategory in revived.Documents)
+            {
+                revivedCategory.ChecklistId = revived.Id;
+            }
+
+            foreach (var revivedSupportingDoc in revived.SupportingDocs)
+            {
+                revivedSupportingDoc.ChecklistId = revived.Id;
+            }
+
+            var clonedUploads = originalUploads.Select(upload => new Upload
+            {
+                Id = Guid.NewGuid(),
+                ChecklistId = revived.Id,
+                DocumentId = upload.DocumentId.HasValue && revivedDocumentIdMap.TryGetValue(upload.DocumentId.Value, out var revivedDocumentId)
+                    ? revivedDocumentId
+                    : null,
+                DocumentName = upload.DocumentName,
+                Category = upload.Category,
+                FileName = upload.FileName,
+                FilePath = upload.FilePath,
+                FileUrl = upload.FileUrl,
+                FileData = upload.FileData,
+                FileSize = upload.FileSize,
+                FileType = upload.FileType,
+                UploadedBy = upload.UploadedBy,
+                UploadedByRole = upload.UploadedByRole,
+                Status = upload.Status,
+                CreatedAt = upload.CreatedAt,
+                UpdatedAt = upload.UpdatedAt,
+            }).ToList();
+
             _context.Checklists.Add(revived);
+            if (clonedUploads.Count > 0)
+            {
+                _context.Uploads.AddRange(clonedUploads);
+            }
             await _context.SaveChangesAsync();
 
             _logger.LogInformation($"✅ Checklist revived successfully. Original: {original.DclNo} ({original.Id}), New: {newDclNo} ({revived.Id})");
@@ -587,6 +663,26 @@ public class CoCreatorController : ControllerBase
 
             var supportingDocs = await CombineSupportingDocsWithUploadsAsync(checklist.Id, checklist);
             var uploadLookup = await GetLatestDocumentUploadsLookupAsync(new[] { checklist.Id });
+
+            if ((!uploadLookup.TryGetValue(checklist.Id, out var checklistUploads) || checklistUploads.Count == 0) &&
+                checklist.DclNo.Contains(" copy ", StringComparison.OrdinalIgnoreCase))
+            {
+                var baseDclNo = checklist.DclNo.Split(" copy ", StringSplitOptions.None)[0].Trim();
+                var originalChecklistId = await _context.Checklists
+                    .AsNoTracking()
+                    .Where(c => c.DclNo == baseDclNo)
+                    .Select(c => (Guid?)c.Id)
+                    .FirstOrDefaultAsync();
+
+                if (originalChecklistId.HasValue)
+                {
+                    var originalUploadLookup = await GetLatestDocumentUploadsLookupAsync(new[] { originalChecklistId.Value });
+                    if (originalUploadLookup.TryGetValue(originalChecklistId.Value, out var originalUploads) && originalUploads.Count > 0)
+                    {
+                        uploadLookup[checklist.Id] = originalUploads;
+                    }
+                }
+            }
 
             return Ok(new
             {
@@ -2760,7 +2856,6 @@ public class CoCreatorController : ControllerBase
         }
 
         return checklistUploads.FirstOrDefault(u =>
-            !u.DocumentId.HasValue &&
             string.Equals((u.DocumentName ?? string.Empty).Trim(), normalizedDocumentName, StringComparison.OrdinalIgnoreCase) &&
             string.Equals((u.Category ?? string.Empty).Trim(), normalizedCategory, StringComparison.OrdinalIgnoreCase));
     }

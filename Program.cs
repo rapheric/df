@@ -18,6 +18,87 @@ using Microsoft.Extensions.Options;
 var builder = WebApplication.CreateBuilder(args);
 var corsOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];
 
+static bool IsLocalOrigin(string value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        return false;
+    }
+
+    if (!Uri.TryCreate(value, UriKind.Absolute, out var uri))
+    {
+        return false;
+    }
+
+    return uri.IsLoopback
+        || uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+        || uri.Host.Equals("127.0.0.1", StringComparison.OrdinalIgnoreCase)
+        || uri.Host.Equals("::1", StringComparison.OrdinalIgnoreCase);
+}
+
+static bool LooksLikePlaceholder(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        return true;
+    }
+
+    var normalized = value.Trim();
+    return normalized.Contains("YOUR_", StringComparison.OrdinalIgnoreCase)
+        || normalized.Contains("example.com", StringComparison.OrdinalIgnoreCase)
+        || normalized.Contains("changeme", StringComparison.OrdinalIgnoreCase)
+        || normalized.Contains("placeholder", StringComparison.OrdinalIgnoreCase);
+}
+
+static void ValidateSecurityConfiguration(WebApplicationBuilder builder, string[] corsOrigins, string connectionString, string jwtSecret)
+{
+    if (string.IsNullOrWhiteSpace(jwtSecret) || jwtSecret.Length < 32)
+    {
+        throw new InvalidOperationException("JWT secret must be configured from a secure source and be at least 32 characters long.");
+    }
+
+    if (corsOrigins.Length == 0)
+    {
+        throw new InvalidOperationException("Cors:AllowedOrigins must be explicitly configured. Permissive fallback origins are not allowed.");
+    }
+
+    var allowedHosts = builder.Configuration["AllowedHosts"];
+    if (!builder.Environment.IsDevelopment())
+    {
+        if (string.IsNullOrWhiteSpace(allowedHosts) || allowedHosts.Trim() == "*")
+        {
+            throw new InvalidOperationException("AllowedHosts must be explicitly restricted outside development.");
+        }
+
+        if (corsOrigins.Any(IsLocalOrigin))
+        {
+            throw new InvalidOperationException("Localhost CORS origins are not allowed outside development.");
+        }
+
+        var loginUrl = builder.Configuration["EmailSettings:LoginUrl"]
+            ?? builder.Configuration["Frontend:LoginUrl"]
+            ?? Environment.GetEnvironmentVariable("APP_LOGIN_URL")
+            ?? Environment.GetEnvironmentVariable("APP_URL");
+        if (IsLocalOrigin(loginUrl ?? string.Empty))
+        {
+            throw new InvalidOperationException("Local login URLs are not allowed outside development.");
+        }
+
+        var chatbotEnabled = builder.Configuration.GetValue<bool>("Chatbot:Enabled");
+        if (chatbotEnabled)
+        {
+            var chatbotProviderBaseUrl = builder.Configuration["Chatbot:ProviderBaseUrl"];
+            if (!string.IsNullOrWhiteSpace(chatbotProviderBaseUrl)
+                && (!Uri.TryCreate(chatbotProviderBaseUrl, UriKind.Absolute, out var chatbotUri)
+                    || chatbotUri.Scheme != Uri.UriSchemeHttps
+                    || LooksLikePlaceholder(chatbotProviderBaseUrl)))
+            {
+                throw new InvalidOperationException("Chatbot:ProviderBaseUrl must be a valid HTTPS endpoint outside development.");
+            }
+        }
+    }
+}
+
 // Add services to the container
 builder.Services.AddControllers()
     .AddJsonOptions(options =>
@@ -34,6 +115,13 @@ builder.Services.AddControllers()
 
 // Configure Database (MySQL with Pomelo)
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
+if (string.IsNullOrWhiteSpace(connectionString))
+{
+    throw new InvalidOperationException(
+        "Database connection string not configured. Set ConnectionStrings__DefaultConnection via environment variables or user secrets."
+    );
+}
+
 ServerVersion serverVersion;
 try
 {
@@ -53,6 +141,8 @@ var jwtSecret = builder.Configuration["JwtSettings:Secret"]
     ?? throw new InvalidOperationException("JWT Secret not configured");
 var jwtIssuer = builder.Configuration["JwtSettings:Issuer"];
 var jwtAudience = builder.Configuration["JwtSettings:Audience"];
+
+ValidateSecurityConfiguration(builder, corsOrigins, connectionString, jwtSecret);
 
 builder.Services.AddAuthentication(options =>
 {
@@ -104,16 +194,7 @@ builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
     {
-        if (corsOrigins.Length > 0)
-        {
-            policy.WithOrigins(corsOrigins)
-                  .AllowAnyMethod()
-                  .AllowAnyHeader()
-                  .AllowCredentials();
-            return;
-        }
-
-        policy.SetIsOriginAllowed(_ => true)
+        policy.WithOrigins(corsOrigins)
               .AllowAnyMethod()
               .AllowAnyHeader()
               .AllowCredentials();
